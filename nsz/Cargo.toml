@@ -1,0 +1,19 @@
+[package]
+name = "nsz"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description.workspace = true
+
+[[bin]]
+name = "nsz"
+path = "src/main.rs"
+
+[dependencies]
+nlzsz-core.workspace = true
+clap.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+log.workspace = true
+env_logger.workspace = true
