@@ -4,12 +4,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use anyhow::{Result, anyhow};
 use clap::{Parser, ValueHint};
+#[cfg(not(unix))]
 use tokio::signal;
 
-use nlzsz_core::protocol::{Config, CompressType};
-use nlzsz_core::transfer::TransferSession;
-use nlzsz_core::utils::*;
-use nlzsz_core::tmux::*;
+use nrzsz_core::protocol::{Config, CompressType};
+use nrzsz_core::transfer::TransferSession;
+use nrzsz_core::utils::*;
+use nrzsz_core::tmux::*;
 
 #[derive(Parser)]
 #[command(name = "nrz")]
@@ -110,13 +111,15 @@ async fn main() -> Result<()> {
         return Err(anyhow!("Not a directory: {}", dest_path.display()));
     }
     
-    let mut config = Config::default();
-    config.quiet = args.quiet || args.fork;
-    config.binary = args.binary;
-    config.directory = args.directory || args.recursive;
-    config.overwrite = args.overwrite;
-    config.compress = CompressType::parse(&args.compress);
-    config.fork = args.fork;
+    let mut config = Config {
+        quiet: args.quiet || args.fork,
+        binary: args.binary,
+        directory: args.directory || args.recursive,
+        overwrite: args.overwrite,
+        compress: CompressType::parse(&args.compress),
+        fork: if args.fork { Some(true) } else { None },
+        ..Config::default()
+    };
     
     if let Some(bufsize) = &args.bufsize {
         config.max_buf_size = parse_size(bufsize)?;
@@ -134,35 +137,83 @@ async fn main() -> Result<()> {
     let tmux_info = detect_tmux()?;
     if let Some(info) = &tmux_info {
         config.tmux_pane_width = info.pane_width;
-        // In tmux normal mode, force binary mode
+        // In tmux normal mode, disable binary mode (nrzsz-go behavior)
+        // and set tmux_output_junk
         if info.mode == TmuxMode::NormalMode {
-            config.binary = true;
+            config.binary = false;
+            config.tmux_output_junk = true;
+            
+            // Print tmux column cleanup sequence for small columns
+            let columns = nrzsz_core::terminal::get_terminal_columns();
+            if columns > 0 && columns < 40 {
+                print!("\n\n\x1b[2A\x1b[0J");
+            } else {
+                print!("\n\x1b[1A\x1b[0J");
+            }
+            io::stdout().flush()?;
         }
     }
     
-    // On Windows, force binary mode
+    // On Windows, disable binary mode (nrzsz-go behavior)
     #[cfg(windows)]
     {
-        config.binary = true;
+        config.binary = false;
     }
     
-    let stdin = io::stdin();
-    let stdout = io::stdout();
+    // Print trigger line for client detection
+    let unique_id = nrzsz_core::protocol::generate_unique_id();
+    let version = env!("CARGO_PKG_VERSION");
+    
+    // Start TCP listener for tunnel connection
+    let listener = std::net::TcpListener::bind("0.0.0.0:0")?;
+    let port = listener.local_addr()?.port();
+    
+    // Print trigger for client to connect via TCP tunnel
+    // Format: \x1b[s::NRZSZ:TRANSFER:R:VERSION:UNIQUEID:PORT\r\n
+    // UNIQUEID is zero-padded to 13 digits (matching nrzsz-go)
+    let unique_id_num: u64 = unique_id.parse().unwrap_or(0);
+    print!("\x1b[s::NRZSZ:TRANSFER:R:{}:{:013}:{}\r\n", version, unique_id_num, port);
+    use std::io::Write as _;
+    io::stdout().flush()?;
+    
+    // Accept TCP connection from client (blocks until client connects)
+    let (mut tcp_stream, _) = listener.accept()?;
+    
+    // Perform the tunnel handshake (verify client hello, respond with server hello)
+    nrzsz_core::tunnel::server_tunnel_handshake(&mut tcp_stream, &unique_id, port)?;
+    
+    // Use TCP stream for stdin/stdout communication
+    let stdin_pipe = tcp_stream.try_clone()?;
+    let stdout_pipe = tcp_stream.try_clone()?;
     
     let mut session = TransferSession::new(
         config.clone(),
-        Box::new(stdin.lock()),
-        Box::new(stdout.lock()),
+        Box::new(stdin_pipe),
+        Box::new(stdout_pipe),
     );
     
     // Set up signal handling
     let stopped = Arc::new(AtomicBool::new(false));
     let stopped_clone = stopped.clone();
-    let created_files_clone = Arc::new(std::sync::Mutex::new(Vec::<std::path::PathBuf>::new()));
-    let created_files_for_signal = created_files_clone.clone();
+    let created_files_shared = Arc::new(std::sync::Mutex::new(Vec::<std::path::PathBuf>::new()));
+    let created_files_for_signal = created_files_shared.clone();
     
     tokio::spawn(async move {
-        signal::ctrl_c().await.ok();
+        // Handle SIGINT (Ctrl+C) and SIGTERM (kill), matching Go's handleServerSignal
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut sigint = signal(SignalKind::interrupt()).expect("install SIGINT handler");
+            let mut sigterm = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+            tokio::select! {
+                _ = sigint.recv() => {}
+                _ = sigterm.recv() => {}
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            signal::ctrl_c().await.ok();
+        }
         
         // Show stop confirmation dialog
         #[cfg(unix)]
@@ -178,7 +229,11 @@ async fn main() -> Result<()> {
                     // Delete created files
                     if let Ok(files) = created_files_for_signal.lock() {
                         for file in files.iter().rev() {
-                            let _ = std::fs::remove_file(file);
+                            if file.is_dir() {
+                                let _ = std::fs::remove_dir_all(file);
+                            } else {
+                                let _ = std::fs::remove_file(file);
+                            }
                         }
                     }
                 }
@@ -186,33 +241,46 @@ async fn main() -> Result<()> {
         }
         
         stopped_clone.store(true, Ordering::SeqCst);
-        nlzsz_core::transfer::set_stopped(true);
+        nrzsz_core::transfer::set_stopped(true);
     });
     
-    // Receive action
+    // Receive action from client (nrzsz-go: recvAction first, no sendAction back)
     let action = session.recv_action()?;
     
-    // Detect remote OS from action
-    let remote_is_windows = action.newline.as_deref() == Some("!\n");
+    // Check client capabilities (matching nrzsz-go behavior)
+    if args.binary && !action.support_binary.unwrap_or(true) {
+        return Err(anyhow!("Binary mode not supported by client"));
+    }
+    if args.fork && !action.fork.unwrap_or(false) {
+        return Err(anyhow!("Fork mode not supported by client"));
+    }
+    if args.directory && !action.support_dir {
+        return Err(anyhow!("Directory mode not supported by client"));
+    }
+    if !action.confirm {
+        session.server_exit("Cancelled")?;
+        return Ok(());
+    }
     
-    // Send action with correct remote OS info
-    session.send_action(true, "0.1.0", remote_is_windows)?;
-    
-    // Receive config
-    let _remote_config = session.recv_config()?;
-    
-    // Send config
+    // Send config to server
     session.send_config(&action)?;
     
     // Receive files
     let local_list = session.recv_files(&dest_path, args.quiet)?;
+    
+    // Sync created files for signal handler cleanup
+    {
+        if let Ok(mut files) = created_files_shared.lock() {
+            files.extend(session.get_created_files().iter().cloned());
+        }
+    }
     
     // Print results
     for file_name in &local_list {
         let file_path = dest_path.join(file_name);
         if file_path.exists() {
             let size = std::fs::metadata(&file_path)?.len();
-            nlzsz_core::progress::print_transfer_result(file_name, true, size)?;
+            nrzsz_core::progress::print_transfer_result(file_name, true, size)?;
         }
     }
     

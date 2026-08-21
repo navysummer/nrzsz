@@ -11,7 +11,7 @@ name = "nsz"
 path = "src/main.rs"
 
 [dependencies]
-nlzsz-core.workspace = true
+nrzsz-core.workspace = true
 clap.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
