@@ -60,6 +60,34 @@ struct Args {
     /// Timeout (N seconds) for each buffer chunk. N <= 0 means never timeout. Default: 20
     #[arg(short = 't', long = "timeout")]
     timeout: Option<u32>,
+    
+    /// ASCII transfer mode (text mode; forces binary off)
+    #[arg(short = 'a', long)]
+    ascii: bool,
+    
+    /// Resume interrupted file transfer (not yet supported by core)
+    #[arg(long)]
+    resume: bool,
+    
+    /// Protect existing files: skip files that already exist (not yet supported by core)
+    #[arg(short = 'p', long)]
+    protect: bool,
+    
+    /// Window size (N bytes) for transfer (not yet supported by core)
+    #[arg(short = 'w', long = "windowsize")]
+    windowsize: Option<u32>,
+    
+    /// Overwrite if source is newer, otherwise skip (approximated as overwrite)
+    #[arg(short = 'Y', long = "overwrite-or-skip")]
+    overwrite_or_skip: bool,
+    
+    /// Force rename if file already exists
+    #[arg(short = 'E', long)]
+    rename: bool,
+    
+    /// Append to existing files (not yet supported by core)
+    #[arg(short = '+', long)]
+    append: bool,
 }
 
 fn parse_size(size_str: &str) -> Result<usize> {
@@ -103,15 +131,40 @@ async fn main() -> Result<()> {
         std::process::exit(1);
     }
     
+    // Fork to background if requested (matching Go's TszMain)
+    if args.fork {
+        if nrzsz_core::fork::fork_to_background()? {
+            return Ok(());
+        }
+    }
+    
+    
     let mut config = Config {
         quiet: args.quiet || args.fork,
-        binary: args.binary,
+        binary: args.binary && !args.ascii,
         directory: args.directory || args.recursive,
-        overwrite: args.overwrite,
+        overwrite: (args.overwrite || args.overwrite_or_skip) && !args.rename,
         compress: CompressType::parse(&args.compress),
         fork: if args.fork { Some(true) } else { None },
         ..Config::default()
     };
+    
+    // ASCII mode: force text mode (newline conversion) and disable binary
+    if args.ascii {
+        config.binary = false;
+        config.newline = "\n".to_string();
+    }
+    
+    // Flags that need core support not yet present
+    if args.protect {
+        eprintln!("nsz: warning: -p/--protect is not yet supported by nrzsz-core");
+    }
+    if args.windowsize.is_some() {
+        eprintln!("nsz: warning: -w/--windowsize is not yet supported by nrzsz-core");
+    }
+    if args.append {
+        eprintln!("nsz: warning: -+/--append is not yet supported by nrzsz-core");
+    }
     
     if let Some(bufsize) = &args.bufsize {
         config.max_buf_size = parse_size(bufsize)?;
@@ -164,7 +217,7 @@ async fn main() -> Result<()> {
     // Format: \x1b[s::NRZSZ:TRANSFER:S:VERSION:UNIQUEID:PORT\r\n
     // UNIQUEID is zero-padded to 13 digits (matching nrzsz-go)
     let unique_id_num: u64 = unique_id.parse().unwrap_or(0);
-    print!("\x1b[s::NRZSZ:TRANSFER:S:{}:{:013}:{}\r\n", version, unique_id_num, port);
+    print!("\x1b[s::TRZSZ:TRANSFER:S:{}:{:013}:{}\r\n", version, unique_id_num, port);
     use std::io::Write as _;
     io::stdout().flush()?;
     

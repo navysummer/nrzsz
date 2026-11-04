@@ -37,6 +37,9 @@ pub struct TransferSession {
     original_tmux_interval: Option<String>,
     negotiated_protocol: u32,
     remote_capabilities: Option<crate::protocol::ClientCapabilities>,
+    // Map of source path_id -> chosen local top-level name, so files from the same
+    // source directory share one destination dir (matching Go's fileNameMap).
+    file_name_map: std::collections::HashMap<u32, String>,
 }
 
 impl TransferSession {
@@ -62,6 +65,7 @@ impl TransferSession {
             original_tmux_interval: None,
             negotiated_protocol: PROTOCOL_VERSION,
             remote_capabilities: None,
+            file_name_map: std::collections::HashMap::new(),
         }
     }
     
@@ -197,7 +201,7 @@ impl TransferSession {
             protocol: PROTOCOL_VERSION,
             newline: "\n".to_string(),
             tunnel: None,
-            fork: None,
+            fork: Some(true),
             tmuxcc: None,
             support_binary: Some(true),
         };
@@ -1431,7 +1435,12 @@ impl TransferSession {
                 
                 let use_compress = self.send_compress_flag(Path::new(&file.abs_path))?;
                 let display_name = file.path_name.join("/");
-                let progress = TransferProgress::new_with_file(data_size, quiet, &display_name);
+                let progress = TransferProgress::new_with_color(
+                    data_size,
+                    quiet,
+                    Some(display_name),
+                    self.config.color_pair_option(),
+                );
                 let md5 = self.send_file_data_with_compress(Path::new(&file.abs_path), data_size, &progress, use_compress, start_offset)?;
                 self.send_file_md5(&md5)?;
                 progress.finish("Done");
@@ -1451,7 +1460,12 @@ impl TransferSession {
                 
                 let (fixed, compress) = self.is_compress_fixed(size);
                 let use_compress = if fixed { compress } else { false };
-                let progress = TransferProgress::new_with_file(size, quiet, &file.path_name.join("/"));
+                let progress = TransferProgress::new_with_color(
+                    size,
+                    quiet,
+                    Some(file.path_name.join("/")),
+                    self.config.color_pair_option(),
+                );
                 let md5 = self.send_file_data_with_compress(Path::new(&file.abs_path), size, &progress, use_compress, 0)?;
                 self.send_file_md5(&md5)?;
                 progress.finish("Done");
@@ -1495,7 +1509,12 @@ impl TransferSession {
                 // Now receive SIZE with ack (remaining size) — matching nrzsz-go recvFileSize
                 let size = self.recv_file_size()?;
                 let use_compress = self.recv_compress_flag(size)?;
-                let progress = TransferProgress::new_with_file(size, quiet, &local_name);
+                let progress = TransferProgress::new_with_color(
+                    size,
+                    quiet,
+                    Some(local_name),
+                    self.config.color_pair_option(),
+                );
                 let md5 = self.recv_file_data_with_compress(&mut file, size, &progress, use_compress)?;
                 self.recv_file_md5(&md5)?;
                 progress.finish("Done");
@@ -1503,7 +1522,12 @@ impl TransferSession {
                 // V2: receive size and data
                 let size = self.recv_file_size()?;
                 let use_compress = self.recv_compress_flag(size)?;
-                let progress = TransferProgress::new_with_file(size, quiet, &local_name);
+                let progress = TransferProgress::new_with_color(
+                    size,
+                    quiet,
+                    Some(local_name),
+                    self.config.color_pair_option(),
+                );
                 let md5 = self.recv_file_data_with_compress(&mut file, size, &progress, use_compress)?;
                 self.recv_file_md5(&md5)?;
                 progress.finish("Done");
@@ -1536,7 +1560,15 @@ impl TransferSession {
         let local_name = if self.config.overwrite {
             file_info.path_name[0].clone()
         } else {
-            get_new_name(dest_path, &file_info.path_name[0])?
+            // Reuse the chosen local name for the same source path_id (Go's fileNameMap),
+            // so multiple files from one source directory land in the same dest directory.
+            if let Some(existing) = self.file_name_map.get(&file_info.path_id) {
+                existing.clone()
+            } else {
+                let name = get_new_name(dest_path, &file_info.path_name[0])?;
+                self.file_name_map.insert(file_info.path_id, name.clone());
+                name
+            }
         };
         
         // Apply permissions if specified
@@ -1598,7 +1630,15 @@ impl TransferSession {
         let local_name = if self.config.overwrite {
             file_info.path_name[0].clone()
         } else {
-            get_new_name(dest_path, &file_info.path_name[0])?
+            // Reuse the chosen local name for the same source path_id (Go's fileNameMap),
+            // so multiple files from one source directory land in the same dest directory.
+            if let Some(existing) = self.file_name_map.get(&file_info.path_id) {
+                existing.clone()
+            } else {
+                let name = get_new_name(dest_path, &file_info.path_name[0])?;
+                self.file_name_map.insert(file_info.path_id, name.clone());
+                name
+            }
         };
         
         let apply_perm = |path: &Path, perm: Option<u32>| {

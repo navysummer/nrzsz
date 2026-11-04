@@ -418,55 +418,54 @@ pub fn strip_vt100(data: &[u8]) -> Vec<u8> {
 #[cfg(windows)]
 pub mod windows_flush {
     use std::io;
-    use std::os::windows::io::AsRawHandle;
-    use winapi::um::fileapi::{GetStdHandle, STD_OUTPUT_HANDLE};
-    use winapi::um::handleapi::INVALID_HANDLE_VALUE;
-    use winapi::um::winbase::ENABLE_VIRTUAL_TERMINAL_PROCESSING;
-    use winapi::um::consoleapi::GetConsoleMode;
-    use winapi::um::consoleapi::SetConsoleMode;
-    
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::System::Console::{
+        GetConsoleMode, GetStdHandle, SetConsoleMode, ENABLE_VIRTUAL_TERMINAL_PROCESSING,
+        STD_OUTPUT_HANDLE,
+    };
+
     pub fn disable_line_wrap() -> Result<(), io::Error> {
         unsafe {
             let handle = GetStdHandle(STD_OUTPUT_HANDLE);
             if handle == INVALID_HANDLE_VALUE {
                 return Err(io::Error::new(io::ErrorKind::Other, "Invalid handle"));
             }
-            
+
             let mut mode = 0;
             if GetConsoleMode(handle, &mut mode) == 0 {
                 return Err(io::Error::new(io::ErrorKind::Other, "GetConsoleMode failed"));
             }
-            
-            // Disable ENABLE_PROCESSED_OUTPUT to prevent line wrapping
+
+            // Disable ENABLE_VIRTUAL_TERMINAL_PROCESSING to prevent line wrapping.
             mode &= !ENABLE_VIRTUAL_TERMINAL_PROCESSING;
-            
+
             if SetConsoleMode(handle, mode) == 0 {
                 return Err(io::Error::new(io::ErrorKind::Other, "SetConsoleMode failed"));
             }
-            
+
             Ok(())
         }
     }
-    
+
     pub fn enable_line_wrap() -> Result<(), io::Error> {
         unsafe {
             let handle = GetStdHandle(STD_OUTPUT_HANDLE);
             if handle == INVALID_HANDLE_VALUE {
                 return Err(io::Error::new(io::ErrorKind::Other, "Invalid handle"));
             }
-            
+
             let mut mode = 0;
             if GetConsoleMode(handle, &mut mode) == 0 {
                 return Err(io::Error::new(io::ErrorKind::Other, "GetConsoleMode failed"));
             }
-            
-            // Enable ENABLE_VIRTUAL_TERMINAL_PROCESSING
+
+            // Enable ENABLE_VIRTUAL_TERMINAL_PROCESSING.
             mode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING;
-            
+
             if SetConsoleMode(handle, mode) == 0 {
                 return Err(io::Error::new(io::ErrorKind::Other, "SetConsoleMode failed"));
             }
-            
+
             Ok(())
         }
     }

@@ -268,6 +268,20 @@ pub struct Config {
     pub fork: Option<bool>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub client_files: Vec<String>,
+    #[serde(default)]
+    pub progress_color_pair: (String, String),
+}
+
+impl Config {
+    /// Returns the progress color pair as an `Option`, or `None` when either
+    /// half is empty (no gradient configured).
+    pub fn color_pair_option(&self) -> Option<(String, String)> {
+        if self.progress_color_pair.0.is_empty() || self.progress_color_pair.1.is_empty() {
+            None
+        } else {
+            Some(self.progress_color_pair.clone())
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -411,6 +425,7 @@ impl Default for Config {
             compress: default_compress(),
             fork: None,
             client_files: Vec::new(),
+            progress_color_pair: (String::new(), String::new()),
         }
     }
 }

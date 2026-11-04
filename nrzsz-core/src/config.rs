@@ -7,15 +7,21 @@ use serde::{Deserialize, Serialize};
 pub struct NrzszConfig {
     #[serde(default = "default_upload_path")]
     pub default_upload_path: String,
-    
+
     #[serde(default = "default_download_path")]
     pub default_download_path: String,
-    
+
     #[serde(default = "default_drag_upload_command")]
     pub drag_file_upload_command: String,
-    
+
     #[serde(default = "default_progress_colors")]
     pub progress_color_pair: (String, String),
+
+    #[serde(default)]
+    pub allowed_auto_upload_dirs: Vec<String>,
+
+    #[serde(default)]
+    pub zmodem_auto_rename: bool,
 }
 
 fn default_upload_path() -> String {
@@ -41,23 +47,87 @@ impl Default for NrzszConfig {
             default_download_path: default_download_path(),
             drag_file_upload_command: default_drag_upload_command(),
             progress_color_pair: default_progress_colors(),
+            allowed_auto_upload_dirs: Vec::new(),
+            zmodem_auto_rename: false,
         }
     }
 }
 
 impl NrzszConfig {
     pub fn load() -> Result<Self> {
-        // Try to load nrzsz.conf first
+        // Try Go-compatible ~/.trzsz.conf first (matches trzsz-go).
+        if let Ok(config) = Self::load_trzsz_conf() {
+            return Ok(config);
+        }
+        // Try to load nrzsz.conf
         if let Ok(config) = Self::load_nrzsz_conf() {
             return Ok(config);
         }
-        
         // Fall back to legacy config for compatibility
         if let Ok(config) = Self::load_legacy_conf() {
             return Ok(config);
         }
-        
         Ok(Self::default())
+    }
+
+    /// Read the Go-compatible ~/.trzsz.conf (key=value, `#` comments, lowercase keys).
+    fn load_trzsz_conf() -> Result<Self> {
+        let home = dirs::home_dir().ok_or_else(|| anyhow!("Cannot find home directory"))?;
+        let path = home.join(".trzsz.conf");
+        if !path.exists() {
+            return Err(anyhow!("Config file not found"));
+        }
+        let content = fs::read_to_string(&path)?;
+        let mut config = Self::default();
+        for line in content.lines() {
+            let line = line.split('#').next().unwrap_or("").trim();
+            if line.is_empty() {
+                continue;
+            }
+            if let Some((key, value)) = line.split_once('=') {
+                let key = key.trim().to_lowercase();
+                let value = value.trim().to_string();
+                if key.is_empty() || value.is_empty() {
+                    continue;
+                }
+                match key.as_str() {
+                    "allowedautouploaddirs" if config.allowed_auto_upload_dirs.is_empty() => {
+                        config.allowed_auto_upload_dirs = value
+                            .split(',')
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                            .collect();
+                    }
+                    "defaultuploadpath" if config.default_upload_path.is_empty() => {
+                        config.default_upload_path = value;
+                    }
+                    "defaultdownloadpath" if config.default_download_path.is_empty() => {
+                        config.default_download_path = value;
+                    }
+                    "dragfileuploadcommand" if config.drag_file_upload_command.is_empty() => {
+                        config.drag_file_upload_command = value;
+                    }
+                    "progresscolorpair" if config.progress_color_pair.0.is_empty() => {
+                        let colors: Vec<&str> = value.split_whitespace().collect();
+                        if colors.len() >= 2 {
+                            config.progress_color_pair = (
+                                colors[0].to_string(),
+                                colors[1].to_string(),
+                            );
+                        }
+                    }
+                    "zmodemautorename" => {
+                        match value.to_lowercase().as_str() {
+                            "on" | "true" | "yes" | "1" => config.zmodem_auto_rename = true,
+                            "off" | "false" | "no" | "0" => config.zmodem_auto_rename = false,
+                            _ => {}
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Ok(config)
     }
     
     fn load_nrzsz_conf() -> Result<Self> {
@@ -159,6 +229,14 @@ impl NrzszConfig {
     
     pub fn get_progress_colors(&self) -> (&str, &str) {
         (&self.progress_color_pair.0, &self.progress_color_pair.1)
+    }
+
+    pub fn get_allowed_auto_upload_dirs(&self) -> &[String] {
+        &self.allowed_auto_upload_dirs
+    }
+
+    pub fn get_zmodem_auto_rename(&self) -> bool {
+        self.zmodem_auto_rename
     }
 }
 

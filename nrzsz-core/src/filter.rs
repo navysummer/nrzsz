@@ -3,6 +3,7 @@ use std::net::TcpStream;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::Mutex;
 use anyhow::{Result, anyhow};
 use regex::Regex;
 use log::debug;
@@ -34,39 +35,69 @@ pub struct NrzszTrigger {
 }
 
 /// Parse a NRZSZ:TRANSFER trigger line
+/// Parse a TRZSZ/NRZSZ:TRANSFER trigger line.
+/// Accepts both the trzsz-go `::TRZSZ:` namespace and the legacy `::NRZSZ:` namespace.
 pub fn parse_trigger(line: &str) -> Option<NrzszTrigger> {
     let line = line.trim();
     let line = line.strip_prefix("\x1b[s").unwrap_or(line);
-    
-    if !line.contains("::NRZSZ:TRANSFER:") {
+
+    // Strip a tmux control-mode prefix: `%output <id> ` or
+    // `%extended-output <id> 0 : `. The trigger line arrives wrapped by tmux
+    // when running under `tmux -CC`; the pane id is needed to route the reply.
+    let mut tmux_prefix = String::new();
+    let mut tmux_pane_id = String::new();
+    let rest = if let Some(r) = line.strip_prefix("%output") {
+        let r = r.trim_start();
+        let pane_id = r.split_whitespace().next().unwrap_or("").to_string();
+        tmux_pane_id = pane_id.clone();
+        tmux_prefix = format!("%output {} ", pane_id);
+        r.split_whitespace().skip(1).collect::<Vec<_>>().join(" ")
+    } else if let Some(r) = line.strip_prefix("%extended-output") {
+        let r = r.trim_start();
+        let pane_id = r.split_whitespace().next().unwrap_or("").to_string();
+        tmux_pane_id = pane_id.clone();
+        tmux_prefix = format!("%extended-output {} 0 : ", pane_id);
+        r.split_whitespace().skip(2).collect::<Vec<_>>().join(" ")
+    } else {
+        line.to_string()
+    };
+    let rest = rest.trim();
+
+    let is_trigger = rest.contains("::TRZSZ:TRANSFER:") || rest.contains("::NRZSZ:TRANSFER:");
+    if !is_trigger {
         return None;
     }
-    
-    let parts: Vec<&str> = line.split(':').collect();
-    if parts.len() < 7 || parts[2] != "NRZSZ" || parts[3] != "TRANSFER" {
+
+    let parts: Vec<&str> = rest.split(':').collect();
+    if parts.len() < 7
+        || !(parts[2] == "TRZSZ" || parts[2] == "NRZSZ")
+        || parts[3] != "TRANSFER"
+    {
         return None;
     }
-    
+
     let mode = parts[4].chars().next()?;
     let version = parts[5].to_string();
     let unique_id = parts[6].to_string();
     let port = parts.get(7).and_then(|p| p.trim().parse::<u16>().ok()).unwrap_or(0);
-    
+
     Some(NrzszTrigger {
         mode,
         version,
         unique_id,
         port,
-        full_line: line.to_string(),
-        tmux_prefix: String::new(),
-        tmux_pane_id: String::new(),
+        full_line: rest.to_string(),
+        tmux_prefix,
+        tmux_pane_id,
     })
 }
 
 /// Regex constants for nrzsz-detector.
-const NRZSZ_REGEX_STR: &str = "::NRZSZ:TRANSFER:([SRDF]):(\\d+\\.\\d+\\.\\d+)(:\\d+)?(:\\d+)?";
-const UNIQUE_ID_REGEX_STR: &str = "::NRZSZ:TRANSFER:[SRDF]:\\d+\\.\\d+\\.\\d+:(\\d{13}\\d*)";
-const TMUX_CC_REGEX_STR: &str = "((%output( %\\d+ ))|(%extended-output( %\\d+ )\\d+ .*: )).*::NRZSZ:TRANSFER:";
+const NRZSZ_REGEX_STR: &str = "::(?:TRZSZ|NRZSZ):TRANSFER:([SRDF]):(\\d+\\.\\d+\\.\\d+)(:\\d+)?(:\\d+)?";
+const UNIQUE_ID_REGEX_STR: &str = "::(?:TRZSZ|NRZSZ):TRANSFER:[SRDF]:\\d+\\.\\d+\\.\\d+:(\\d{13}\\d*)";
+const TMUX_CC_REGEX_STR: &str = "((%output( %\\d+ ))|(%extended-output( %\\d+ )\\d+ .*: )).*::(?:TRZSZ|NRZSZ):TRANSFER:";
+
+
 
 /// Trigger detector matching Go's nrzszDetector.
 /// Handles relay mode unique-ID rewriting, tmux CC detection, repeat-ID filtering.
@@ -114,7 +145,10 @@ impl NrzszDetector {
             return buf.to_vec();
         }
         // Find the end of the trigger line
-        if let Some(idx) = buf.windows(20).position(|w| w == b"::NRZSZ:TRANSFER:") {
+        // Find the end of the trigger line (either namespace)
+        let ns_idx = buf.windows(20).position(|w| w == b"::TRZSZ:TRANSFER:")
+            .or_else(|| buf.windows(20).position(|w| w == b"::NRZSZ:TRANSFER:"));
+        if let Some(idx) = ns_idx {
             if idx + 20 < buf.len() {
                 let mut end = idx + 20;
                 while end < buf.len() {
@@ -167,7 +201,7 @@ impl NrzszDetector {
         }
 
         let text = String::from_utf8_lossy(output).to_string();
-        let mut idx = match text.rfind("::NRZSZ:TRANSFER:") {
+        let mut idx = match text.rfind("::TRZSZ:TRANSFER:").or_else(|| text.rfind("::NRZSZ:TRANSFER:")) {
             Some(i) => i,
             None => return (output.to_vec(), None),
         };
@@ -178,7 +212,7 @@ impl NrzszDetector {
             buf = self.rewrite_unique_id(&buf);
             // Re-find after rewriting
             let text2 = String::from_utf8_lossy(&buf);
-            if let Some(new_idx) = text2.rfind("::NRZSZ:TRANSFER:") {
+            if let Some(new_idx) = text2.rfind("::TRZSZ:TRANSFER:").or_else(|| text2.rfind("::NRZSZ:TRANSFER:")) {
                 idx = new_idx;
             }
         }
@@ -233,7 +267,7 @@ impl NrzszDetector {
         } else {
             // Replace NRZSZ with NRZSZGO to prevent re-detection (matching Go's NRZSZ→NRZSZGO)
             let buf_str = String::from_utf8_lossy(&buf);
-            buf = buf_str.replace("NRZSZ", "NRZSZGO").into_bytes();
+            buf = buf_str.replace("TRZSZ", "TRZSZGO").replace("NRZSZ", "NRZSZGO").into_bytes();
         }
 
         let trigger = NrzszTrigger {
@@ -279,13 +313,17 @@ pub struct NrzszFilter {
     skip_upload_command: Arc<AtomicBool>,
     current_upload_command: Arc<std::sync::Mutex<String>>,
     interrupting: Arc<AtomicBool>,
+    zmodem: Option<Arc<crate::zmodem::ZmodemState>>,
+    zmodem_auto_rename: bool,
+    client_out: Arc<Mutex<Box<dyn std::io::Write + Send>>>,
+    server_in: Arc<Mutex<Box<dyn std::io::Write + Send>>>,
 }
 
 impl NrzszFilter {
     pub fn new(config: Config) -> Self {
         Self {
             config,
-            trigger_regex: Regex::new(r"NRZSZ:TRANSFER").unwrap(),
+            trigger_regex: Regex::new(r"(?:TRZSZ|NRZSZ):TRANSFER").unwrap(),
             running: false,
             output_buffer: Vec::new(),
             stopped: Arc::new(AtomicBool::new(false)),
@@ -309,8 +347,25 @@ impl NrzszFilter {
             skip_upload_command: Arc::new(AtomicBool::new(false)),
             current_upload_command: Arc::new(std::sync::Mutex::new(String::new())),
             interrupting: Arc::new(AtomicBool::new(false)),
+            zmodem: None,
+            zmodem_auto_rename: false,
+            client_out: Arc::new(Mutex::new(Box::new(std::io::sink()))),
+            server_in: Arc::new(Mutex::new(Box::new(std::io::sink()))),
         }
     }
+
+    pub fn set_zmodem_auto_rename(&mut self, enable: bool) {
+        self.zmodem_auto_rename = enable;
+    }
+
+    pub fn set_server_in(&mut self, writer: Arc<Mutex<Box<dyn std::io::Write + Send>>>) {
+        self.server_in = writer;
+    }
+
+    pub fn set_client_out(&mut self, writer: Arc<Mutex<Box<dyn std::io::Write + Send>>>) {
+        self.client_out = writer;
+    }
+
     
     pub fn set_enable_osc52(&mut self, enable: bool) {
         self.enable_osc52 = enable;
@@ -409,16 +464,22 @@ impl NrzszFilter {
         }
     }
 
-    /// Read configuration from ~/.nrzsz.conf
+    /// Read configuration from ~/.trzsz.conf (Go-compatible) or ~/.nrzsz.conf.
+    /// Go's TrzszFilter.readTrzszConfig() reads ~/.trzsz.conf; we prefer it for
+    /// cross-tool compatibility and fall back to our own ~/.nrzsz.conf.
     pub fn read_config(&mut self) {
         let home = match std::env::var("HOME") {
             Ok(h) => h,
             Err(_) => return,
         };
-        let path = std::path::PathBuf::from(home).join(".nrzsz.conf");
-        let content = match std::fs::read_to_string(&path) {
+        let trzsz_path = std::path::PathBuf::from(&home).join(".trzsz.conf");
+        let nrzsz_path = std::path::PathBuf::from(&home).join(".nrzsz.conf");
+        let content = match std::fs::read_to_string(&trzsz_path) {
             Ok(c) => c,
-            Err(_) => return,
+            Err(_) => match std::fs::read_to_string(&nrzsz_path) {
+                Ok(c) => c,
+                Err(_) => return,
+            },
         };
         for line in content.lines() {
             let line = if let Some(idx) = line.find('#') {
@@ -448,6 +509,13 @@ impl NrzszFilter {
                     }
                     "progresscolorpair" if self.progress_color_pair.is_empty() => {
                         self.progress_color_pair = value;
+                    }
+                    "zmodemautorename" => {
+                        match value.to_lowercase().as_str() {
+                            "on" | "true" | "yes" | "1" => self.set_zmodem_auto_rename(true),
+                            "off" | "false" | "no" | "0" => self.set_zmodem_auto_rename(false),
+                            _ => debug!("ZmodemAutoRename {:?} is invalid", value),
+                        }
                     }
                     _ => {}
                 }
@@ -523,7 +591,72 @@ impl NrzszFilter {
         if self.enable_osc52 {
             self.osc52.detect_osc52(input);
         }
-        
+
+        // Zmodem passthrough: route server output to an active transfer, or
+        // detect the ZMODEM init sequence and launch the local rz/sz client.
+        if self.zmodem.is_some() {
+            let keep = {
+                let z = self.zmodem.as_ref().unwrap();
+                z.handle_server_output(input)
+            };
+            if !keep {
+                self.zmodem = None;
+            }
+            return Ok(input.to_vec());
+        }
+        if self.enable_zmodem {
+            if let Some(zmodem) = crate::zmodem::detect_zmodem(
+                input,
+                self.zmodem_auto_rename,
+                self.server_in.clone(),
+                self.client_out.clone(),
+            ) {
+                debug!("Detected ZMODEM init (upload={})", zmodem.is_upload());
+                let state = zmodem.state.clone();
+                let choose_upload = {
+                    let upload_files = self.upload_files.clone();
+                    let one_time = self.one_time_upload_files.clone();
+                    let default_upload = self.default_upload_path.clone();
+                    let drag_cmd = self.drag_file_upload_command.clone();
+                    let allowed = self.allowed_auto_upload_dirs.clone();
+                    move || -> Result<Vec<String>> {
+                        // Use pre-set upload files, else show a file dialog.
+                        if !upload_files.is_empty() {
+                            return Ok(upload_files.clone());
+                        }
+                        if !one_time.is_empty() {
+                            return Ok(one_time.clone());
+                        }
+                        crate::zmodem::choose_upload_files(drag_cmd.clone(), allowed.clone(), default_upload.clone())
+                    }
+                };
+                let choose_download = {
+                    let default_download = self.default_download_path.clone();
+                    move || -> Result<String> {
+                        if !default_download.is_empty() {
+                            return Ok(default_download.clone());
+                        }
+                        crate::zmodem::choose_download_path()
+                    }
+                };
+                let interrupting = self.interrupting.clone();
+                let callback = self.transfer_state_callback.clone();
+                let state2 = state.clone();
+                std::thread::spawn(move || {
+                    if let Some(ref cb) = callback {
+                        cb(true);
+                    }
+                    crate::zmodem::handle_zmodem_event(state2, choose_upload, choose_download);
+                    if let Some(ref cb) = callback {
+                        cb(false);
+                    }
+                    interrupting.store(false, Ordering::SeqCst);
+                });
+                self.zmodem = Some(state);
+                return Ok(input.to_vec());
+            }
+        }
+
         self.output_buffer.extend_from_slice(input);
         
         let mut output = Vec::new();
@@ -610,6 +743,14 @@ impl NrzszFilter {
             return buf.to_vec();
         }
 
+        // Zmodem passthrough: forward Ctrl+C to the active transfer to cancel it.
+        if let Some(ref z) = self.zmodem {
+            if buf.contains(&0x03) {
+                z.stop_transferring_files();
+            }
+            return buf.to_vec();
+        }
+
         if self.is_transferring.load(Ordering::SeqCst) {
             // Transfer in progress, forward all input
             return buf.to_vec();
@@ -626,16 +767,22 @@ impl NrzszFilter {
                 debug!("Detected drag files: {:?}", drag_info.files);
                 let files = drag_info.files.clone();
                 let has_dir = drag_info.has_dir;
+                let tmux_pane_id = drag_info.tmux_pane_id.clone();
+                let tmux_blocks = drag_info.tmux_blocks;
                 let upload_cmd = self.drag_file_upload_command.clone();
                 let is_transferring = self.is_transferring.clone();
                 let interrupting = self.interrupting.clone();
                 let skip = self.skip_upload_command.clone();
                 let current_cmd = self.current_upload_command.clone();
 
+                let server_in = self.server_in.clone();
+
                 std::thread::spawn(move || {
                     upload_drag_files(&files, has_dir, &upload_cmd,
-                                      &is_transferring, &interrupting, &skip, &current_cmd);
+                                      &is_transferring, &interrupting, &skip, &current_cmd,
+                                      server_in, &tmux_pane_id, tmux_blocks);
                 });
+
                 return Vec::new();
             }
         }
@@ -738,6 +885,25 @@ struct TransferCtx {
 impl TransferCtx {
     fn run_transfer(&self, trigger: &NrzszTrigger) -> Result<()> {
         debug!("run_transfer mode={}", trigger.mode);
+
+        // In tmux `-CC` control mode, all terminal output (progress bar, final
+        // messages, stop prompts) written to process stdout must be wrapped in
+        // tmux `%output <pane> ` messages. The transfer code writes to
+        // `std::io::stdout()` directly (transfer.rs), so we redirect fd 1
+        // through an encoder thread for the whole transfer (matching Go's
+        // per-write `encodeTmuxOutput` in progress.go and transfer.go).
+        let _tmux_redirect = if trigger.tmux_prefix.is_empty() {
+            None
+        } else {
+            match crate::tmuxcc::TmuxOutputRedirect::start(&trigger.tmux_prefix) {
+                Ok(r) => Some(r),
+                Err(e) => {
+                    debug!("tmux-CC stdout redirect failed, continuing without it: {}", e);
+                    None
+                }
+            }
+        };
+
         let connector = self.connector.as_ref()
             .ok_or_else(|| anyhow!("No tunnel connector set"))?;
         let mut stream = connector(trigger.port)?;
@@ -747,9 +913,11 @@ impl TransferCtx {
         stream.write_all(b"\n")?;
         stream.flush()?;
         
-        let mut buf = [0u8; 100];
-        let n = stream.read(&mut buf)?;
-        let response = String::from_utf8_lossy(&buf[..n]).trim().to_string();
+        // Read the server hello line by line (byte-at-a-time until `\n`), so we
+        // never over-read into the next frame. A fixed `read` into a buffer can
+        // consume part of the following protocol message, desyncing the stream.
+        let response = crate::tunnel::read_line_from_stream(&mut stream)?;
+        let response = response.trim().to_string();
         if response != server_hello {
             return Err(anyhow!("Tunnel: unexpected server hello: {:?}", response));
         }
@@ -794,8 +962,27 @@ impl TransferCtx {
         session.send_action(true, &trigger.version, false)?;
         let config = session.recv_config()?;
         
+        // Mode semantics (matching Go's handleTrzsz):
+        //   'S' = download, 'R' = upload (choose files), 'D' = upload directory, 'F' = upload specified files
         let directory = trigger.mode == 'D';
-        let files = if !self.upload_files.is_empty() {
+        let files_specified = trigger.mode == 'F';
+        // In 'F' mode, files come from client_files/config; directory determined by whether
+        // any file is a directory (matching Go's filesSpecified flow).
+        let files = if files_specified {
+            // 'F' mode: the client (wrapper) provides the actual files via -u.
+            // config.client_files carries the names the server expects, but the
+            // real paths come from the client's upload_files (-u).
+            if !self.upload_files.is_empty() {
+                self.upload_files.clone()
+            } else if !config.client_files.is_empty() {
+                if !self.allowed_auto_upload_dirs.is_empty() {
+                    self.check_auto_upload_allowed(&config.client_files)?;
+                }
+                config.client_files.clone()
+            } else {
+                return Err(anyhow!("No files specified to upload"));
+            }
+        } else if !self.upload_files.is_empty() {
             self.upload_files.clone()
         } else if !config.client_files.is_empty() {
             if !self.allowed_auto_upload_dirs.is_empty() {
@@ -804,6 +991,13 @@ impl TransferCtx {
             config.client_files.clone()
         } else {
             return Err(anyhow!("No upload files specified"));
+        };
+        
+        // For 'F' mode with client files, auto-detect directory if any path is a dir
+        let directory = if files_specified {
+            files.iter().any(|f| std::path::Path::new(f).is_dir())
+        } else {
+            directory
         };
         
         let file_list = crate::transfer::check_paths_readable(&files, directory)?;
@@ -828,9 +1022,9 @@ impl TransferCtx {
                 std::env::current_dir()?.join(path)
             };
             let canonical = abs.canonicalize().unwrap_or(abs);
-            let canonical_str = canonical.to_string_lossy();
+            let canonical_str = canonical.to_string_lossy().to_string();
             let allowed = self.allowed_auto_upload_dirs.iter().any(|dir| {
-                canonical_str.starts_with(dir)
+                is_path_within_dir(&canonical_str, dir)
             });
             if !allowed {
                 return Err(anyhow!("File is outside the allowed auto upload directories: {}", file));
@@ -840,8 +1034,30 @@ impl TransferCtx {
     }
 }
 
+/// Check whether `abs_path` is inside `abs_dir` (either the dir itself or a descendant).
+/// Matching Go's isPathWithinDir: rejects `/a/bc2` when allowed dir is `/a/bc`.
+fn is_path_within_dir(abs_path: &str, abs_dir: &str) -> bool {
+    let dir = abs_dir.trim_end_matches('/');
+    if dir.is_empty() {
+        return false;
+    }
+    if abs_path == dir {
+        return true;
+    }
+    if let Some(rest) = abs_path.strip_prefix(dir) {
+        return rest.starts_with('/');
+    }
+    false
+}
+
+
+
+
+
+
+
 pub fn detect_nrzsz_trigger(output: &str) -> bool {
-    output.contains("NRZSZ:TRANSFER")
+    output.contains("TRZSZ:TRANSFER") || output.contains("NRZSZ:TRANSFER")
 }
 
 /// Detect if user input contains drag-and-dropped file paths.
@@ -851,8 +1067,26 @@ pub fn detect_drag_files(buf: &[u8]) -> DragFilesInfo {
         return DragFilesInfo::default();
     }
 
-    let mut input = buf;
     let mut info = DragFilesInfo::default();
+
+    // Decode tmux `-CC` control-mode input (matching Go's detectDragFiles):
+    // a sequence of `send ...` commands with `;`/`\r` separators. The pane id
+    // and block count are needed to emit the iTerm2 `%begin`/`%end` acks.
+    let owned_input;
+    let mut input: &[u8] = buf;
+    if input[0] == b's' && input.len() > 15 && input.contains(&b';') {
+        if let Some((decoded, pane_id)) = decode_tmux_drag_input(input) {
+            if !pane_id.is_empty() {
+                info.tmux_pane_id = pane_id;
+                info.tmux_blocks = count_tmux_blocks(input);
+            }
+            owned_input = decoded;
+            input = &owned_input;
+            if input.len() < 2 {
+                return info;
+            }
+        }
+    }
 
     // Strip bracketed paste mode sequences
     if input.len() > 5 {
@@ -896,6 +1130,58 @@ pub fn detect_drag_files(buf: &[u8]) -> DragFilesInfo {
     }
     info
 }
+/// Decode a tmux `-CC` control-mode drag input buffer into (payload, pane_id).
+/// Matches Go's `decodeTmuxInput` for the drag path: extracts the `send -t %<pane>`
+/// or `send -lt %<pane>` payloads and the pane id.
+fn decode_tmux_drag_input(buf: &[u8]) -> Option<(Vec<u8>, String)> {
+    let mut payload = Vec::new();
+    let mut pane_id = String::new();
+    let parts: Vec<&[u8]> = buf.split(|&b| b == b';' || b == b'\r').collect();
+    for part in &parts {
+        let cmd = String::from_utf8_lossy(part).trim().to_string();
+        if cmd.len() < 13 || !cmd.starts_with("send ") {
+            continue;
+        }
+        let rest = cmd.strip_prefix("send ").unwrap_or("");
+        if let Some(after) = rest.strip_prefix("-lt %") {
+            if let Some(pos) = after.find(' ') {
+                if pane_id.is_empty() {
+                    pane_id = format!("%{}", &after[..pos]);
+                }
+                payload.extend_from_slice(&after[pos + 1..].as_bytes());
+            }
+        } else if let Some(after) = rest.strip_prefix("-t %") {
+            if let Some(pos) = after.find(' ') {
+                if pane_id.is_empty() {
+                    pane_id = format!("%{}", &after[..pos]);
+                }
+                // Hex-encoded payload (0xNN ...) — decode literal bytes.
+                let hex_part = &after[pos + 1..];
+                let mut bytes = Vec::new();
+                for tok in hex_part.split_whitespace() {
+                    if let Some(hex) = tok.strip_prefix("0x") {
+                        if let Ok(v) = u8::from_str_radix(hex, 16) {
+                            bytes.push(v);
+                        }
+                    }
+                }
+                payload.extend_from_slice(&bytes);
+            }
+        }
+    }
+    if pane_id.is_empty() && payload.is_empty() {
+        None
+    } else {
+        Some((payload, pane_id))
+    }
+}
+
+/// Count the number of `;`/`\r` separators in a tmux control-mode input buffer
+/// (matching Go's `tmuxBlocks` counting in detectDragFiles).
+fn count_tmux_blocks(buf: &[u8]) -> usize {
+    buf.iter().filter(|&&b| b == b';' || b == b'\r').count()
+}
+
 
 fn strip_bracketed_paste(buf: &[u8]) -> Option<&[u8]> {
     if let Some(start) = buf.windows(6).position(|w| w == b"\x1b[200~") {
@@ -946,6 +1232,9 @@ fn upload_drag_files(
     interrupting: &Arc<AtomicBool>,
     skip_upload_command: &Arc<AtomicBool>,
     current_upload_command: &Arc<std::sync::Mutex<String>>,
+    server_in: Arc<Mutex<Box<dyn std::io::Write + Send>>>,
+    tmux_pane_id: &str,
+    tmux_blocks: usize,
 ) {
     if is_transferring.load(Ordering::SeqCst) {
         return;
@@ -953,9 +1242,33 @@ fn upload_drag_files(
 
     let _ = files;
     interrupting.store(true, Ordering::SeqCst);
-    std::thread::sleep(std::time::Duration::from_millis(300));
+
+    // In tmux `-CC` control mode, interrupt the current pane and emit the
+    // iTerm2 `%begin`/`%end` progress acks (matching Go's uploadDragFiles):
+    // `%begin <now> 1 1\r\n%end <now> 1 1\r\n` written (tmuxBlocks - 1) times.
+    if !tmux_pane_id.is_empty() {
+        if tmux_blocks > 1 {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let ack = format!("%begin {} 1 1\r\n%end {} 1 1\r\n", now, now);
+            for _ in 1..tmux_blocks {
+                let _ = std::io::Write::write_all(&mut std::io::stderr(), ack.as_bytes());
+            }
+        }
+        let mut w = server_in.lock().unwrap();
+        let cmd = format!("send -t {} 0x3\r", tmux_pane_id);
+        let _ = w.write_all(cmd.as_bytes());
+        let _ = w.flush();
+        drop(w);
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    } else {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    }
     interrupting.store(false, Ordering::SeqCst);
 
+    std::thread::sleep(std::time::Duration::from_millis(200));
     skip_upload_command.store(true, Ordering::SeqCst);
     let mut command = if upload_command.is_empty() {
         "trz".to_string()
@@ -968,11 +1281,60 @@ fn upload_drag_files(
 
     *current_upload_command.lock().unwrap() = command.clone();
     debug!("Upload drag files command: {}", command);
+
+    // Send the trz command to server stdin (matching Go's writeAll(filter.serverIn, buffer)).
+    let mut buffer = command.clone().into_bytes();
+    buffer.push(b'\r');
+    let mut w = server_in.lock().unwrap();
+    if w.write_all(&buffer).is_ok() {
+        let _ = w.flush();
+    }
 }
+
+
+
+
+
+
+
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_is_path_within_dir() {
+        assert!(is_path_within_dir("/a/bc", "/a/bc"));
+        assert!(is_path_within_dir("/a/bc/file", "/a/bc"));
+        assert!(is_path_within_dir("/a/bc/dir/file.txt", "/a/bc"));
+        assert!(!is_path_within_dir("/a/bc2", "/a/bc"));
+        assert!(!is_path_within_dir("/a/bc2/file", "/a/bc"));
+        assert!(!is_path_within_dir("/a", "/a/bc"));
+        assert!(!is_path_within_dir("/a/bc", "/"));
+    }
+
+    #[test]
+    fn test_parse_trigger_trzsz_namespace() {
+        let line = "::TRZSZ:TRANSFER:D:1.2.0:1234567890123:9090";
+        let trigger = parse_trigger(line).unwrap();
+        assert_eq!(trigger.mode, 'D');
+        assert_eq!(trigger.version, "1.2.0");
+        assert_eq!(trigger.unique_id, "1234567890123");
+        assert_eq!(trigger.port, 9090);
+    }
+
+    #[test]
+    fn test_parse_trigger_nrzsz_legacy_namespace() {
+        let line = "::NRZSZ:TRANSFER:R:0.1.0:9876543210987:8080";
+        let trigger = parse_trigger(line).unwrap();
+        assert_eq!(trigger.mode, 'R');
+        assert_eq!(trigger.port, 8080);
+    }
+
+    #[test]
+    fn test_parse_trigger_unknown_namespace() {
+        assert!(parse_trigger("::OTHER:TRANSFER:S:1.0:123:456").is_none());
+    }
 
     #[test]
     fn test_parse_trigger_recv() {
@@ -1048,7 +1410,7 @@ mod tests {
 
     #[test]
     fn test_should_skip_output() {
-        let mut filter = NrzszFilter::new(Config::default());
+        let filter = NrzszFilter::new(Config::default());
         filter.skip_upload_command.store(true, Ordering::SeqCst);
         *filter.current_upload_command.lock().unwrap() = "trz -d".to_string();
         assert!(filter.should_skip_output(b"trz -d\r\n"));
@@ -1057,11 +1419,70 @@ mod tests {
 
     #[test]
     fn test_should_skip_output_no_match() {
-        let mut filter = NrzszFilter::new(Config::default());
+        let filter = NrzszFilter::new(Config::default());
         filter.skip_upload_command.store(true, Ordering::SeqCst);
         *filter.current_upload_command.lock().unwrap() = "trz".to_string();
         assert!(!filter.should_skip_output(b"other output\r\n"));
     }
+
+    #[test]
+    fn test_process_input_drag_uploads_command() {
+        let mut filter = NrzszFilter::new(Config::default());
+        filter.enable_dragfile = true;
+        // Shared buffer writer so we can inspect what drag upload writes.
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let writer_buf = buf.clone();
+        let writer: Arc<Mutex<Box<dyn std::io::Write + Send>>> = Arc::new(Mutex::new(Box::new(
+            SharedBufferWriter { buf: writer_buf },
+        )));
+        filter.server_in = writer;
+
+        let paste = b"\x1b[200~/tmp/nrzsz_t/mydir/a.txt\x1b[201~";
+        let result = filter.process_input(paste);
+        // Drag detected → consume input, send "trz\r" to server stdin.
+        assert!(result.is_empty());
+        std::thread::sleep(std::time::Duration::from_millis(800));
+        let guard = buf.lock().unwrap();
+        let s = String::from_utf8_lossy(&guard);
+        assert_eq!(s, "trz\r");
+    }
+
+    #[test]
+    fn test_process_input_drag_uploads_command_with_dir() {
+        let mut filter = NrzszFilter::new(Config::default());
+        filter.enable_dragfile = true;
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let writer_buf = buf.clone();
+        let writer: Arc<Mutex<Box<dyn std::io::Write + Send>>> = Arc::new(Mutex::new(Box::new(
+            SharedBufferWriter { buf: writer_buf },
+        )));
+        filter.server_in = writer;
+
+        let paste = b"\x1b[200~/tmp/nrzsz_t/mydir\x1b[201~";
+        let result = filter.process_input(paste);
+        assert!(result.is_empty());
+        std::thread::sleep(std::time::Duration::from_millis(800));
+        let guard = buf.lock().unwrap();
+        let s = String::from_utf8_lossy(&guard);
+        assert_eq!(s, "trz -d\r");
+    }
+
+    /// Simple writer that appends to a shared Vec<u8>.
+    struct SharedBufferWriter {
+        buf: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl std::io::Write for SharedBufferWriter {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            self.buf.lock().unwrap().extend_from_slice(data);
+            Ok(data.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+
 
     #[test]
     fn test_process_input_passthrough() {
@@ -1079,9 +1500,50 @@ mod tests {
 
     #[test]
     fn test_process_input_transferring() {
-        let mut filter = NrzszFilter::new(Config::default());
+        let filter = NrzszFilter::new(Config::default());
         filter.is_transferring.store(true, Ordering::SeqCst);
         let result = filter.process_input(b"hello");
         assert_eq!(result, b"hello");
+    }
+    #[test]
+    fn test_tunnel_hello_read_does_not_overread() {
+        // Regression: the client's server-hello read must not consume bytes of
+        // the following protocol frame. A fixed `read(&mut [u8; 100])` can
+        // return `server_hello\n` coalesced with the next frame's bytes, which
+        // were then trimmed away, desyncing the stream (intermittent
+        // "Invalid format: " / blank-line failures).
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            // Write hello and the next frame in a single write (coalesced).
+            let mut buf = Vec::new();
+            buf.extend_from_slice(b"::TRZSZ::SERVER::HELLO::abc:1234\n");
+            buf.extend_from_slice(b"#CFG:abcdefgh\n");
+            conn.write_all(&buf).unwrap();
+            // Server then waits for the client's next frame and echoes it.
+            let mut read_buf = [0u8; 64];
+            let n = conn.read(&mut read_buf).unwrap();
+            conn.write_all(&read_buf[..n]).unwrap();
+            conn.flush().unwrap();
+        });
+
+        let mut client = std::net::TcpStream::connect(addr).unwrap();
+        let hello = crate::tunnel::read_line_from_stream(&mut client).unwrap();
+        assert_eq!(hello.trim(), "::TRZSZ::SERVER::HELLO::abc:1234");
+        // The next frame must still be readable (not consumed by the hello read).
+        let mut next = [0u8; 16];
+        let n = client.read(&mut next).unwrap();
+        assert_eq!(&next[..n], b"#CFG:abcdefgh\n");
+
+        // Client sends the next frame; server echoes it back.
+        client.write_all(b"#DATA:1234\n").unwrap();
+        let mut echoed = [0u8; 16];
+        let n = client.read(&mut echoed).unwrap();
+        assert_eq!(&echoed[..n], b"#DATA:1234\n");
+        let _ = server.join();
     }
 }

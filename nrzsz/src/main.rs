@@ -3,11 +3,13 @@ use std::io::{self, Read, Write};
 use std::process::{Command, Stdio};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::Mutex;
 use anyhow::Result;
 use clap::Parser;
-use log::debug;
+
+
 use nrzsz_core::config::NrzszConfig;
-use nrzsz_core::filter::{NrzszFilter, detect_drag_files};
+use nrzsz_core::filter::NrzszFilter;
 use nrzsz_core::protocol::Config;
 use nrzsz_core::relay::NrzszRelay;
 
@@ -92,6 +94,9 @@ fn main() -> Result<()> {
             std::net::TcpStream::connect(("127.0.0.1", port))
                 .map_err(|e| anyhow::anyhow!("Relay tunnel connect to {} failed: {}", port, e))
         });
+        if args.tracelog {
+            relay.set_trace_logger(nrzsz_core::tracelog::TraceLogger::new());
+        }
         relay.run()?;
         child.wait()?;
         return Ok(());
@@ -124,13 +129,25 @@ fn main() -> Result<()> {
     filter.set_enable_zmodem(args.zmodem);
     filter.set_enable_dragfile(args.dragfile);
     filter.start()?;
-
-    // Spawn two threads: stdin→child stdin (wrapInput), child stdout→terminal (wrapOutput)
-    let child_stdin = child.stdin.take().unwrap();
-    let child_stdout = child.stdout.take().unwrap();
     let stopped = filter.stopped_flag();
     let is_transferring = filter.is_transferring_flag();
-    let dragfile = args.dragfile;
+
+    // Shared writer to child stdin: used by both wrapInput and drag-upload.
+    let child_stdin = child.stdin.take().unwrap();
+    let child_stdin_writer: Arc<Mutex<Box<dyn Write + Send>>> =
+        Arc::new(Mutex::new(Box::new(child_stdin)));
+    filter.set_server_in(child_stdin_writer.clone());
+
+    // Shared stdout writer: used by wrapOutput and by zmodem progress output.
+    let stdout_writer: Arc<Mutex<Box<dyn Write + Send>>> =
+        Arc::new(Mutex::new(Box::new(io::stdout())));
+    filter.set_client_out(stdout_writer.clone());
+
+    let filter = std::sync::Arc::new(std::sync::Mutex::new(filter));
+
+
+    // Spawn two threads: stdin→child stdin (wrapInput), child stdout→terminal (wrapOutput)
+    let child_stdout = child.stdout.take().unwrap();
 
     // Handle SIGINT (Ctrl+C) → stop transferring files
     // Handle SIGTERM → terminate child
@@ -145,17 +162,24 @@ fn main() -> Result<()> {
 
     // Thread 1: wrapInput — reads real stdin, forwards to child stdin
     let input_stopped = stopped.clone();
+    let input_filter = filter.clone();
     let input_handle = std::thread::spawn(move || {
-        wrap_input(io::stdin(), child_stdin, input_stopped, dragfile)
+        wrap_input(io::stdin(), child_stdin_writer, input_stopped, input_filter)
     });
 
     // Thread 2: wrapOutput — reads child stdout, processes through filter, writes to terminal
     // Go's wrapOutput: detect triggers, handle OSC52, forward to client
     let output_stopped = stopped.clone();
     let output_is_transferring = is_transferring.clone();
+    let output_filter = filter.clone();
     let output_handle = std::thread::spawn(move || {
-        wrap_output(child_stdout, io::stdout(), filter, output_stopped, output_is_transferring)
+        wrap_output(child_stdout, stdout_writer, output_filter, output_stopped, output_is_transferring)
     });
+
+
+
+
+
 
     // Wait for output thread (signals child exit)
     let _ = output_handle.join();
@@ -166,13 +190,14 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+
 /// wrapInput: Read from client stdin and write to server stdin.
 /// Matches Go's TrzszFilter.wrapInput() — detect drag file, forward to server.
 fn wrap_input(
     mut client_in: impl Read,
-    mut server_in: impl Write,
+    server_in: Arc<Mutex<Box<dyn Write + Send>>>,
     stopped: Arc<std::sync::atomic::AtomicBool>,
-    detect_drag: bool,
+    filter: std::sync::Arc<std::sync::Mutex<NrzszFilter>>,
 ) {
     let mut buf = [0u8; 32 * 1024];
     loop {
@@ -182,18 +207,21 @@ fn wrap_input(
         match client_in.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
-                if detect_drag {
-                    let drag_info = detect_drag_files(&buf[..n]);
-                    if !drag_info.files.is_empty() {
-                        debug!("Detected drag files: {:?}", drag_info.files);
-                        // In a full integration, this would spawn upload_drag_files
-                        // For now, forward to server
+                // Process input through the filter (detects drag files, sends trz cmd).
+                let to_forward = {
+                    let f = filter.lock().unwrap();
+                    f.process_input(&buf[..n])
+                };
+                if to_forward.is_empty() {
+                    continue;
+                }
+                {
+                    let mut w = server_in.lock().unwrap();
+                    if w.write_all(&to_forward).is_err() {
+                        break;
                     }
+                    w.flush().ok();
                 }
-                if server_in.write_all(&buf[..n]).is_err() {
-                    break;
-                }
-                server_in.flush().ok();
             }
             Err(_) => break,
         }
@@ -204,12 +232,13 @@ fn wrap_input(
 /// Matches Go's TrzszFilter.wrapOutput() — detect triggers, OSC52, skipUploadCommand, forward to client.
 fn wrap_output(
     mut server_out: impl Read,
-    mut client_out: impl Write,
-    mut filter: NrzszFilter,
+    client_out: Arc<Mutex<Box<dyn Write + Send>>>,
+    filter: std::sync::Arc<std::sync::Mutex<NrzszFilter>>,
     stopped: Arc<std::sync::atomic::AtomicBool>,
     is_transferring: Arc<std::sync::atomic::AtomicBool>,
 ) {
     let mut buf = [0u8; 32 * 1024];
+
     loop {
         if stopped.load(Ordering::SeqCst) {
             break;
@@ -221,18 +250,21 @@ fn wrap_output(
                     continue;
                 }
                 // Skip upload command echo (matching Go's skipUploadCommand)
-                if filter.should_skip_output(&buf[..n]) {
-                    continue;
-                }
-                let output = match filter.process_output(&buf[..n]) {
-                    Ok(o) => o,
-                    Err(_) => break,
+                let output = {
+                    let mut f = filter.lock().unwrap();
+                    if f.should_skip_output(&buf[..n]) {
+                        continue;
+                    }
+                    match f.process_output(&buf[..n]) {
+                        Ok(o) => o,
+                        Err(_) => break,
+                    }
                 };
                 if !output.is_empty() {
-                    if client_out.write_all(&output).is_err() {
+                    if client_out.lock().unwrap().write_all(&output).is_err() {
                         break;
                     }
-                    client_out.flush().ok();
+                    client_out.lock().unwrap().flush().ok();
                 }
             }
             Err(_) => break,

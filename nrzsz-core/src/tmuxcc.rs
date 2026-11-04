@@ -121,6 +121,236 @@ pub fn encode_tmux_output(prefix: &str, output: &[u8]) -> Vec<u8> {
     buf
 }
 
+/// Detect tmux `-CC` drag input (`send -lt %N /` or the iTerm2 bracketed-paste
+/// sequence), matching Go's `hasTmuxSendPrefix` (drag.go).
+/// Only meaningful on macOS (iTerm2 drags); Go gates this to macOS too.
+pub fn has_tmux_send_prefix(buf: &[u8]) -> bool {
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = buf;
+        return false;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let mut i = 0;
+        // send -lt %N /
+        if match_at(buf, &mut i, "send -lt %")
+            && skip_num(buf, &mut i)
+            && match_at(buf, &mut i, " /")
+            && !match_at(buf, &mut i, "\r")
+        {
+            return true;
+        }
+
+        i = 0;
+        // send -t %N 0x1b 0x5b;
+        if !match_at(buf, &mut i, "send -t %")
+            || !skip_num(buf, &mut i)
+            || !match_at(buf, &mut i, " 0x1b 0x5b; ")
+        {
+            return false;
+        }
+        // send -lt %N 200;
+        if !match_at(buf, &mut i, "send -lt %")
+            || !skip_num(buf, &mut i)
+            || !match_at(buf, &mut i, " 200; ")
+        {
+            return false;
+        }
+        // send -t %N 0x7e;
+        if !match_at(buf, &mut i, "send -t %")
+            || !skip_num(buf, &mut i)
+            || !match_at(buf, &mut i, " 0x7e; ")
+        {
+            return false;
+        }
+        // send -lt %N /
+        if !match_at(buf, &mut i, "send -lt %")
+            || !skip_num(buf, &mut i)
+            || !match_at(buf, &mut i, " /")
+            || match_at(buf, &mut i, "\r")
+        {
+            return false;
+        }
+        true
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn match_at(buf: &[u8], i: &mut usize, s: &str) -> bool {
+    let b = s.as_bytes();
+    if buf.len() - *i < b.len() {
+        return false;
+    }
+    for j in 0..b.len() {
+        if buf[*i + j] != b[j] {
+            return false;
+        }
+    }
+    *i += b.len();
+    true
+}
+
+#[cfg(target_os = "macos")]
+fn skip_num(buf: &[u8], i: &mut usize) -> bool {
+    let start = *i;
+    while *i < buf.len() && buf[*i].is_ascii_digit() {
+        *i += 1;
+    }
+    *i > start
+}
+
+/// Redirects the process's stdout (fd 1) and stderr (fd 2) through a pipe
+/// drained by threads that re-emit each chunk via `encode_tmux_output`, so
+/// that during a tmux `-CC` transfer all terminal output — including the
+/// indicatif progress bar, which draws to stderr — is wrapped in tmux
+/// control-mode `%output` messages (matching Go's per-write
+/// `encodeTmuxOutput` wrapping in progress.go and ctrlc.go).
+///
+/// The redirect stays active for the lifetime of the value and is restored on
+/// drop. Only meaningful on Unix; a no-op elsewhere.
+pub struct TmuxOutputRedirect {
+    #[cfg(unix)]
+    saved_fds: [i32; 2],
+    #[cfg(unix)]
+    encoders: Vec<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(unix)]
+impl TmuxOutputRedirect {
+    /// Start redirecting fd 1 and fd 2 through the tmux-encoder threads.
+    pub fn start(prefix: &str) -> std::io::Result<Self> {
+        use std::io::{Read, Write};
+        use std::os::fd::FromRawFd;
+
+        let mut saved_fds = [0i32; 2];
+        let mut encoders: Vec<std::thread::JoinHandle<()>> = Vec::with_capacity(2);
+
+        for fd in [1i32, 2i32] {
+            let mut pipe_fds = [0i32; 2];
+            if unsafe { libc::pipe(pipe_fds.as_mut_ptr()) } != 0 {
+                for saved in saved_fds {
+                    if saved > 0 {
+                        unsafe { libc::close(saved) };
+                    }
+                }
+                for h in encoders {
+                    let _ = h.join();
+                }
+                return Err(std::io::Error::last_os_error());
+            }
+            let (read_fd, write_fd) = (pipe_fds[0], pipe_fds[1]);
+
+            let saved_fd = unsafe { libc::dup(fd) };
+            if saved_fd < 0 {
+                unsafe {
+                    libc::close(read_fd);
+                    libc::close(write_fd);
+                }
+                for saved in saved_fds {
+                    if saved > 0 {
+                        unsafe { libc::close(saved) };
+                    }
+                }
+                for h in encoders {
+                    let _ = h.join();
+                }
+                return Err(std::io::Error::last_os_error());
+            }
+
+            // The encoder thread writes to its own dup of the real fd so that
+            // its encoded output bypasses the redirect.
+            let out_fd = unsafe { libc::dup(saved_fd) };
+            if out_fd < 0 {
+                unsafe {
+                    libc::close(read_fd);
+                    libc::close(write_fd);
+                    libc::close(saved_fd);
+                }
+                for saved in saved_fds {
+                    if saved > 0 {
+                        unsafe { libc::close(saved) };
+                    }
+                }
+                for h in encoders {
+                    let _ = h.join();
+                }
+                return Err(std::io::Error::last_os_error());
+            }
+
+            let prefix = prefix.to_string();
+            let encoder = std::thread::spawn(move || {
+                let mut reader = unsafe { std::fs::File::from_raw_fd(read_fd) };
+                let mut writer = unsafe { std::fs::File::from_raw_fd(out_fd) };
+                let mut buf = [0u8; 8192];
+                loop {
+                    match reader.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            let encoded = encode_tmux_output(&prefix, &buf[..n]);
+                            let _ = writer.write_all(&encoded);
+                            let _ = writer.flush();
+                        }
+                    }
+                }
+            });
+
+            // Point fd at the pipe write end.
+            if unsafe { libc::dup2(write_fd, fd) } < 0 {
+                let err = std::io::Error::last_os_error();
+                unsafe {
+                    libc::close(write_fd);
+                    libc::close(saved_fd);
+                }
+                for saved in saved_fds {
+                    if saved > 0 {
+                        unsafe { libc::close(saved) };
+                    }
+                }
+                for h in encoders {
+                    let _ = h.join();
+                }
+                let _ = encoder.join();
+                return Err(err);
+            }
+            unsafe { libc::close(write_fd) };
+            saved_fds[(fd - 1) as usize] = saved_fd;
+            encoders.push(encoder);
+        }
+
+        Ok(Self {
+            saved_fds,
+            encoders,
+        })
+    }
+}
+
+#[cfg(unix)]
+impl Drop for TmuxOutputRedirect {
+    fn drop(&mut self) {
+        unsafe {
+            // Restore fd 1 and fd 2; this also closes the last reference to
+            // the pipe write ends so the encoder threads see EOF and exit.
+            for (i, saved) in self.saved_fds.iter().enumerate() {
+                let fd = (i + 1) as i32;
+                libc::dup2(*saved, fd);
+                libc::close(*saved);
+            }
+        }
+        for encoder in self.encoders.drain(..) {
+            let _ = encoder.join();
+        }
+    }
+}
+
+#[cfg(not(unix))]
+impl TmuxOutputRedirect {
+    pub fn start(_prefix: &str) -> std::io::Result<Self> {
+        Ok(Self {})
+    }
+}
+
 /// Check if a byte can be sent as a literal character in tmux control mode.
 /// Matches Go's canSendAsLiteralCharacter.
 pub fn can_send_as_literal(b: u8) -> bool {

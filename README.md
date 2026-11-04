@@ -38,7 +38,7 @@ nrz /tmp
 This prints a trigger line like:
 
 ```
-::NRZSZ:TRANSFER:RECEIVE:4:abc123:12345
+:::TRZSZ:TRANSFER:R:0.1.0:37692865470000:58263
 ```
 
 **Step 2:** On the **local** machine, send files:
@@ -219,27 +219,32 @@ start_relay(&relay_opts)?;
 
 ## Compatibility
 
-Fully wire-format compatible with:
-- `trzsz-go` v1.2.0+ (trz / tsz)
-- `lrzsz` (rz / sz) basic mode
-- tmux CC mode
+- `trzsz-go` v1.2.0+ (trz / tsz) — the primary compatibility target. The
+  `::TRZSZ:` wire namespace and protocol V1–V4 are matched.
+- `lrzsz` (rz / sz) — interop via the `-z` zmodem passthrough (implemented):
+  a self-contained ZMODEM engine bridges raw streams to a legacy `rz`/`sz`.
 
 ## Feature highlights
 
-- **134/134 features** (100%) matching trzsz-go v1.2.0
+- **trzsz-go v1.2.0 feature coverage** (see `AGENTS.md` for the full matrix):
+  V1–V4 negotiation, zstd+zlib compression, V3 resume, directory transfer,
+  fork, tunnel, relay, OSC52, drag upload (incl. iTerm2 `%begin`/`%end`),
+  zenity dialogs, tracelog, tmux normal + `-CC` control mode,
+  `~/.trzsz.conf`, progress color gradient, lrzsz-style CLI flags.
 - Protocol V1–V4 with version negotiation and downgrade
 - Zstd + Zlib compression with auto-detection
 - V3 resume (prefix hash at 10MB steps)
 - Directory transfer with recursive mode
 - Background fork transfer
-- tmux CC integration
 - OSC52 clipboard support
-- Zmodem passthrough (lrzsz compatible)
-- Drag file upload support
+- Zmodem passthrough (`-z`): self-contained engine (no external `rz`/`sz`),
+  detects `**\x18B0[01]hex`, sends/receives raw ZMODEM frames, progress +
+  cancel. Verified end-to-end against real lrzsz binaries (upload + download).
+- Drag file upload support (iTerm2 + Warp + bracketed-paste prefixes)
 - Zenity file dialogs
-- iTerm2 integration
-- Windows ConPTY support
-- Cross-platform (macOS, Linux, Windows)
+- tmux normal mode + `-CC` control mode integration
+- Cross-platform (macOS, Linux, Windows; the Windows build is fixed and the
+  ConPTY path is implemented, but runtime on a Windows host is untested here)
 
 ## License
 

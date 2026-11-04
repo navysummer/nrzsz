@@ -119,8 +119,9 @@ pub fn upload_files(host: &str, port: u16, files: &[PathBuf], options: NrzszOpti
     let mut stream = std::net::TcpStream::connect((host, port))?;
     let unique_id = format!("{:013}", std::process::id() as u64);
     let uid_prefix = &unique_id[..unique_id.len()-2];
-    let client_hello = format!("::NRZSZ::CLIENT::HELLO::{}:{}", uid_prefix, port);
-    let server_hello = format!("::NRZSZ::SERVER::HELLO::{}:{}", uid_prefix, port);
+    let client_hello = format!("::TRZSZ::CLIENT::HELLO::{}:{}", uid_prefix, port);
+    let server_hello = format!("::TRZSZ::SERVER::HELLO::{}:{}", uid_prefix, port);
+
 
     stream.write_all(client_hello.as_bytes())?;
     stream.write_all(b"\n")?;
@@ -163,8 +164,9 @@ pub fn download_files(host: &str, port: u16, dest: &Path, options: NrzszOptions)
     let mut stream = std::net::TcpStream::connect((host, port))?;
     let unique_id = format!("{:013}", std::process::id() as u64);
     let uid_prefix = &unique_id[..unique_id.len()-2];
-    let client_hello = format!("::NRZSZ::CLIENT::HELLO::{}:{}", uid_prefix, port);
-    let server_hello = format!("::NRZSZ::SERVER::HELLO::{}:{}", uid_prefix, port);
+    let client_hello = format!("::TRZSZ::CLIENT::HELLO::{}:{}", uid_prefix, port);
+    let server_hello = format!("::TRZSZ::SERVER::HELLO::{}:{}", uid_prefix, port);
+
 
     stream.write_all(client_hello.as_bytes())?;
     stream.write_all(b"\n")?;

@@ -21,6 +21,10 @@ struct Args {
     #[arg(value_hint = ValueHint::DirPath)]
     path: Option<String>,
     
+    /// Absolute path of a file or directory on the client to upload (repeatable)
+    #[arg(short = 'F', long = "file", value_hint = ValueHint::FilePath)]
+    file: Vec<String>,
+    
     /// Quiet (hide progress bar)
     #[arg(short, long)]
     quiet: bool,
@@ -60,6 +64,34 @@ struct Args {
     /// Timeout (N seconds) for each buffer chunk. N <= 0 means never timeout. Default: 20
     #[arg(short = 't', long = "timeout")]
     timeout: Option<u32>,
+    
+    /// ASCII transfer mode (text mode; forces binary off)
+    #[arg(short = 'a', long)]
+    ascii: bool,
+    
+    /// Resume interrupted file transfer (not yet supported by core)
+    #[arg(long)]
+    resume: bool,
+    
+    /// Protect existing files: skip files that already exist (not yet supported by core)
+    #[arg(short = 'p', long)]
+    protect: bool,
+    
+    /// Window size (N bytes) for transfer (not yet supported by core)
+    #[arg(short = 'w', long = "windowsize")]
+    windowsize: Option<u32>,
+    
+    /// Overwrite if source is newer, otherwise skip (approximated as overwrite)
+    #[arg(short = 'Y', long = "overwrite-or-skip")]
+    overwrite_or_skip: bool,
+    
+    /// Force rename if file already exists
+    #[arg(short = 'E', long)]
+    rename: bool,
+    
+    /// Append to existing files (not yet supported by core)
+    #[arg(short = '+', long)]
+    append: bool,
 }
 
 fn parse_size(size_str: &str) -> Result<usize> {
@@ -98,6 +130,13 @@ async fn main() -> Result<()> {
     
     let args = Args::parse();
     
+    // Fork to background if requested (matching Go's TrzMain)
+    if args.fork {
+        if nrzsz_core::fork::fork_to_background()? {
+            return Ok(());
+        }
+    }
+    
     let dest_path = match &args.path {
         Some(path) => PathBuf::from(path),
         None => std::env::current_dir()?,
@@ -113,13 +152,35 @@ async fn main() -> Result<()> {
     
     let mut config = Config {
         quiet: args.quiet || args.fork,
-        binary: args.binary,
+        binary: args.binary && !args.ascii,
         directory: args.directory || args.recursive,
-        overwrite: args.overwrite,
+        overwrite: (args.overwrite || args.overwrite_or_skip) && !args.rename,
         compress: CompressType::parse(&args.compress),
         fork: if args.fork { Some(true) } else { None },
         ..Config::default()
     };
+    
+    // ASCII mode: force text mode (newline conversion) and disable binary
+    if args.ascii {
+        config.binary = false;
+        config.newline = "\n".to_string();
+    }
+    
+    // Flags that need core support not yet present
+    if args.protect {
+        eprintln!("nrz: warning: -p/--protect is not yet supported by nrzsz-core");
+    }
+    if args.windowsize.is_some() {
+        eprintln!("nrz: warning: -w/--windowsize is not yet supported by nrzsz-core");
+    }
+    if args.append {
+        eprintln!("nrz: warning: -+/--append is not yet supported by nrzsz-core");
+    }
+    // Client-specified files to upload (matching Go's -F/--file -> client_files)
+    if !args.file.is_empty() {
+        config.client_files = args.file.clone();
+    }
+    
     
     if let Some(bufsize) = &args.bufsize {
         config.max_buf_size = parse_size(bufsize)?;
@@ -172,7 +233,15 @@ async fn main() -> Result<()> {
     // Format: \x1b[s::NRZSZ:TRANSFER:R:VERSION:UNIQUEID:PORT\r\n
     // UNIQUEID is zero-padded to 13 digits (matching nrzsz-go)
     let unique_id_num: u64 = unique_id.parse().unwrap_or(0);
-    print!("\x1b[s::NRZSZ:TRANSFER:R:{}:{:013}:{}\r\n", version, unique_id_num, port);
+    // Trigger mode (matching Go's TrzMain): F if client files specified, D if directory, else R
+    let mode = if !args.file.is_empty() {
+        'F'
+    } else if config.directory {
+        'D'
+    } else {
+        'R'
+    };
+    print!("\x1b[s::TRZSZ:TRANSFER:{}:{}:{:013}:{}\r\n", mode, version, unique_id_num, port);
     use std::io::Write as _;
     io::stdout().flush()?;
     

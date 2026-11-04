@@ -40,6 +40,7 @@ pub struct NrzszRelay {
     tunnel_connector: SharedTunnelConnector,
     closed: Arc<AtomicBool>,
     transfer_state_callback: SharedCallback,
+    trace_logger: Option<crate::tracelog::TraceLogger>,
 }
 
 impl NrzszRelay {
@@ -61,8 +62,14 @@ impl NrzszRelay {
             tunnel_connector: Arc::new(std::sync::Mutex::new(None)),
             closed: Arc::new(AtomicBool::new(false)),
             transfer_state_callback: Arc::new(std::sync::Mutex::new(None)),
+            trace_logger: None,
         }
     }
+
+    pub fn set_trace_logger(&mut self, logger: crate::tracelog::TraceLogger) {
+        self.trace_logger = Some(logger);
+    }
+
 
     pub fn set_tunnel_connector<F>(&mut self, connector: F)
     where
@@ -147,6 +154,7 @@ impl NrzszRelay {
         let trigger_mode = self.trigger_mode.clone();
         let tunnel_connector = self.tunnel_connector.clone();
         let closed = self.closed.clone();
+        let trace_logger = self.trace_logger.clone();
 
         thread::spawn(move || {
             let mut buf = [0u8; 32768];
@@ -243,9 +251,19 @@ impl NrzszRelay {
                             }
                         }
 
-                        let mut w = client_out.lock().unwrap();
-                        w.write_all(data).ok();
-                        w.flush().ok();
+                        // Trace log server output (ttocli), matching Go's relay.
+                        if let Some(logger) = &trace_logger {
+                            let logged = logger.write_trace_log(data, "ttocli");
+                            let mut w = client_out.lock().unwrap();
+                            w.write_all(&logged).ok();
+                            w.flush().ok();
+                        } else {
+                            let mut w = client_out.lock().unwrap();
+                            w.write_all(data).ok();
+                            w.flush().ok();
+                        }
+
+
                     }
                     Err(_) => break,
                 }
@@ -382,7 +400,7 @@ fn do_relay_handshake(
 fn detect_trigger_in_buffer(buf: &[u8]) -> Option<crate::filter::NrzszTrigger> {
     // Find the last occurrence of ::NRZSZ:TRANSFER: in the buffer
     let text = String::from_utf8_lossy(buf);
-    let idx = text.rfind("::NRZSZ:TRANSFER:")?;
+    let idx = text.rfind("::TRZSZ:TRANSFER:").or_else(|| text.rfind("::NRZSZ:TRANSFER:"))?;
     let line = &text[idx..];
     // Take up to the newline
     let line = line.split('\n').next().unwrap_or(line);
@@ -529,5 +547,22 @@ mod tests {
         let trigger = detect_trigger_in_buffer(buf);
         assert!(trigger.is_some());
         assert_eq!(trigger.unwrap().mode, 'R');
+    }
+
+    #[test]
+    fn test_detect_trigger_trzsz_namespace() {
+        let buf = b"some output\n\x1b[s::TRZSZ:TRANSFER:D:1.2.0:1234567890123:9090\r\nmore\n";
+        let trigger = detect_trigger_in_buffer(buf).unwrap();
+        assert_eq!(trigger.mode, 'D');
+        assert_eq!(trigger.port, 9090);
+
+
+
+    }
+
+    #[test]
+    fn test_detect_trigger_no_match() {
+        let buf = b"just plain output\r\n";
+        assert!(detect_trigger_in_buffer(buf).is_none());
     }
 }
