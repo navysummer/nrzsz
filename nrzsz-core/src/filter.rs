@@ -942,7 +942,7 @@ impl TransferCtx {
     
     fn download_files_from(&self, session: &mut TransferSession, trigger: &NrzszTrigger) -> Result<()> {
         // Client is the receiver (server nsz is sending)
-        session.send_action(true, &trigger.version, false)?;
+        session.send_action(true, &trigger.version, false, true)?;
         let config = session.recv_config()?;
         
         let dest = if self.default_download_path.is_empty() {
@@ -959,7 +959,7 @@ impl TransferCtx {
     
     fn upload_files_to(&self, session: &mut TransferSession, trigger: &NrzszTrigger) -> Result<()> {
         // Client is the sender (server nrz is receiving)
-        session.send_action(true, &trigger.version, false)?;
+        session.send_action(true, &trigger.version, false, true)?;
         let config = session.recv_config()?;
         
         // Mode semantics (matching Go's handleTrzsz):

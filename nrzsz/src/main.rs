@@ -34,6 +34,9 @@ struct Args {
     #[arg(short = 'z', long)]
     zmodem: bool,
 
+    #[arg(short = 'E', long = "rename")]
+    rename: bool,
+
     #[arg(short = 'o', long)]
     osc52: bool,
 
@@ -127,7 +130,7 @@ fn main() -> Result<()> {
     }
     filter.set_enable_osc52(args.osc52);
     filter.set_enable_zmodem(args.zmodem);
-    filter.set_enable_dragfile(args.dragfile);
+    filter.set_zmodem_auto_rename(args.rename);
     filter.start()?;
     let stopped = filter.stopped_flag();
     let is_transferring = filter.is_transferring_flag();
@@ -287,7 +290,7 @@ fn print_help() {
     println!("  -t, --tracelog     enable trace log for debugging");
     println!("  -d, --dragfile     enable drag file(s) to upload");
     println!("  -z, --zmodem       enable zmodem lrzsz (rz / sz)");
-    println!("  -o, --osc52        enable clipboard integration");
+    println!("  -E, --rename       zmodem: rename if the target file exists");
     println!("  -u, --upload       upload file(s) to the remote (repeatable)");
     println!("  -D, --download-dir directory to save downloaded files");
 }

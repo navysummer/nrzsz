@@ -192,7 +192,7 @@ impl TransferSession {
             .is_none_or(|caps| caps.support_compress)
     }
     
-    pub fn send_action(&mut self, confirm: bool, version: &str, remote_is_windows: bool) -> Result<()> {
+    pub fn send_action(&mut self, confirm: bool, version: &str, remote_is_windows: bool, tunnel_connected: bool) -> Result<()> {
         let action = crate::protocol::Action {
             lang: "rust".to_string(),
             confirm,
@@ -201,10 +201,12 @@ impl TransferSession {
             protocol: PROTOCOL_VERSION,
             newline: "\n".to_string(),
             tunnel: None,
-            fork: Some(true),
+            // Go: SupportFork is advertised only when the tunnel is connected.
+            fork: Some(tunnel_connected),
             tmuxcc: None,
             support_binary: Some(true),
         };
+        
         
         let mut action = action;
         
@@ -294,6 +296,19 @@ impl TransferSession {
         if self.config.overwrite {
             cfg_map.insert("overwrite".to_string(), serde_json::Value::Bool(true));
         }
+        if self.config.protect {
+            cfg_map.insert("protect".to_string(), serde_json::Value::Bool(true));
+        }
+        if self.config.append {
+            cfg_map.insert("append".to_string(), serde_json::Value::Bool(true));
+        }
+        if self.config.overwrite_newer {
+            cfg_map.insert("overwrite_newer".to_string(), serde_json::Value::Bool(true));
+        }
+        if let Some(ws) = self.config.window_size {
+            cfg_map.insert("window_size".to_string(), serde_json::Value::Number(serde_json::Number::from(ws)));
+        }
+        
         
         // tmux_output_junk
         #[cfg(unix)]
@@ -913,16 +928,30 @@ impl TransferSession {
     /// V3+ file name exchange with prefix hash for resume support
     /// Sends full FileInfo JSON (matching Go's sendFileNameV3 - always JSON in V3),
     /// receives TargetFile JSON, then does prefix hash exchange
-    /// Returns remaining file size after resume prefix hash
-    pub fn send_file_name_v3(&mut self, file: &FileInfo) -> Result<u64> {
+    /// Returns (remaining file size after resume prefix hash, skipped).
+    /// `skipped` is true when the receiver refused the file (protect /
+    /// not-newer); the caller must not send SIZE/DATA/MD5 for it.
+    pub fn send_file_name_v3(&mut self, file: &FileInfo) -> Result<(u64, bool)> {
         // Send full file info as JSON (Go's sendFileNameV3 always marshals sourceFile)
         let file_json = serde_json::to_string(file)?;
         send_string(&mut self.stdout, "NAME", &file_json, &self.config.newline)?;
         
-        // Receive target file (name + size for resume)
+        // Receive target file (name + size for resume / append)
         let mut buf = Vec::new();
         let target_json = recv_string(&mut self.stdin, "SUCC", &mut buf, &self.config.newline)?;
         let target: crate::protocol::TargetFile = serde_json::from_str(&target_json)?;
+        
+        // Receiver skipped the file (protect / not-newer): no data follows.
+        if target.skip {
+            return Ok((0, true));
+        }
+        
+        // Append mode: the receiver opened the existing file and will append
+        // every byte we send. Send the whole source from offset 0.
+        if target.append {
+            return Ok((file.size, false));
+        }
+        
         
         // Prefix hash exchange for resume support
         if target.size > 0 && file.size > 0 {
@@ -942,9 +971,9 @@ impl TransferSession {
                 f.seek(std::io::SeekFrom::Start(matched_step))?;
             }
             
-            Ok(file.size - matched_step)
+            Ok((file.size - matched_step, false))
         } else {
-            Ok(file.size)
+            Ok((file.size, false))
         }
     }
     
@@ -961,7 +990,88 @@ impl TransferSession {
             return Err(anyhow!("Filename too long (max 255 characters)"));
         }
         
-        // Create file (without truncation for resume support)
+        // Compute the destination local name (same selection as create_dir_or_file_v3)
+        let local_name = if self.config.overwrite {
+            src_file.path_name[0].clone()
+        } else if let Some(existing) = self.file_name_map.get(&src_file.path_id) {
+            existing.clone()
+        } else {
+            let name = get_new_name(dest_path, &src_file.path_name[0])?;
+            self.file_name_map.insert(src_file.path_id, name.clone());
+            name
+        };
+        let file_name = src_file.path_name.last().unwrap().clone();
+        
+        // Determine the natural destination path (the name the user chose, not
+        // any rename) — used for protect / newer / append existence checks.
+        let natural_name = src_file.path_name[0].clone();
+        let natural_path = if src_file.path_name.len() > 1 {
+            dest_path.join(&natural_name)
+                .join(src_file.path_name[1..src_file.path_name.len()-1].iter().collect::<PathBuf>())
+                .join(&file_name)
+        } else {
+            dest_path.join(&natural_name)
+        };
+        
+        // ---- Skip decision: protect (`-p`) and overwrite-newer (`-Y`) ----
+        let dest_exists = natural_path.exists() && !src_file.is_dir;
+        if dest_exists {
+            if self.config.protect {
+                // lrzsz `-p`/`ZF1_ZMPROT`: skip if destination exists.
+                let target = crate::protocol::TargetFile {
+                    name: local_name.clone(),
+                    size: 0,
+                    skip: true,
+                    append: false,
+                };
+                send_string(&mut self.stdout, "SUCC", &serde_json::to_string(&target)?, &self.config.newline)?;
+                return Ok((None, local_name, file_name, 0));
+            }
+            if self.config.overwrite_newer {
+                // lrzsz `-Y`/`Lskipnocor`: overwrite only if the source is newer.
+                let dest_mtime = fs::metadata(&natural_path).ok().and_then(|m| m.modified().ok())
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_nanos() as i64);
+                let src_mtime = src_file.mtime_ns;
+                // Skip when destination is at least as new as the source.
+                let should_skip = match (dest_mtime, src_mtime) {
+                    (Some(d), Some(s)) => d >= s,
+                    _ => true, // no mtime info: treat as not-newer, skip
+                };
+                if should_skip {
+                    let target = crate::protocol::TargetFile {
+                        name: local_name.clone(),
+                        size: 0,
+                        skip: true,
+                        append: false,
+                    };
+                    send_string(&mut self.stdout, "SUCC", &serde_json::to_string(&target)?, &self.config.newline)?;
+                    return Ok((None, local_name, file_name, 0));
+                }
+                // Source is newer: overwrite at the natural path (truncate).
+                self.config.overwrite = true;
+            }
+        }
+        
+        // ---- Append decision (`-+`/`ZF1_ZMAPND`) ----
+        if self.config.append && dest_exists {
+            let append_offset = fs::metadata(&natural_path).map(|m| m.len()).unwrap_or(0);
+            let mut open_opts = fs::OpenOptions::new();
+            open_opts.read(true).write(true).append(true);
+            let file = open_opts.open(&natural_path)?;
+            let target = crate::protocol::TargetFile {
+                name: natural_name.clone(),
+                size: append_offset as i64,
+                skip: false,
+                append: true,
+            };
+            send_string(&mut self.stdout, "SUCC", &serde_json::to_string(&target)?, &self.config.newline)?;
+            // Sender sends only the tail (file.size - append_offset). No prefix hash.
+            return Ok((Some(file), natural_name, file_name, src_file.size as u64));
+        }
+        
+        
+        // ---- Normal create (without truncation for resume support) ----
         let (mut file, local_name, file_name) = self.create_dir_or_file_v3(dest_path, &src_file)?;
         
         // Get file size for target file response
@@ -976,6 +1086,8 @@ impl TransferSession {
         let target = crate::protocol::TargetFile {
             name: local_name.clone(),
             size: tgt_size as i64,
+            skip: false,
+            append: false,
         };
         let target_json = serde_json::to_string(&target)?;
         send_string(&mut self.stdout, "SUCC", &target_json, &self.config.newline)?;
@@ -1103,6 +1215,17 @@ impl TransferSession {
         Ok(compress)
     }
     
+    
+    /// Effective buffer cap: `window_size` when set (lrzsz `-w`), otherwise
+    /// `max_buf_size`. Never exceeds `max_buf_size`.
+    fn effective_buf_cap(&self) -> usize {
+        self.config.window_size
+            .map(|w| w as usize)
+            .filter(|w| *w > 0)
+            .map(|w| w.min(self.config.max_buf_size))
+            .unwrap_or(self.config.max_buf_size)
+    }
+    
     pub fn send_file_data(&mut self, file_path: &Path, size: u64, progress: &TransferProgress) -> Result<Vec<u8>> {
         let mut file = File::open(file_path)?;
         let mut buf_size: usize = 1024; // Start small for fast start
@@ -1120,6 +1243,8 @@ impl TransferSession {
         } else {
             crate::compress::CompressAlgo::None
         };
+        
+        let buf_cap = self.effective_buf_cap();
         
         while sent < size {
             let chunk_start = std::time::Instant::now();
@@ -1156,9 +1281,9 @@ impl TransferSession {
             // Time-based buffer adaptation (matching nrzsz-go)
             let chunk_time = chunk_start.elapsed();
             self.set_last_chunk_time(chunk_time);
-            if bytes_read == buf_size && chunk_time < std::time::Duration::from_millis(500) && buf_size < self.config.max_buf_size {
+            if bytes_read == buf_size && chunk_time < std::time::Duration::from_millis(500) && buf_size < buf_cap {
                 // Double buffer if chunk was full and fast
-                buf_size = (buf_size * 2).min(self.config.max_buf_size);
+                buf_size = (buf_size * 2).min(buf_cap);
                 buf.resize(buf_size, 0);
             } else if chunk_time >= std::time::Duration::from_secs(2) && buf_size > 1024 {
                 // Reduce buffer if too slow
@@ -1258,6 +1383,8 @@ impl TransferSession {
             crate::compress::CompressAlgo::None
         };
         
+        let buf_cap = self.effective_buf_cap();
+        
         while sent < size {
             // V3: check stop/pause before each chunk (sends pause markers if pausing)
             if self.negotiated_protocol >= crate::protocol::PROTOCOL_V3 {
@@ -1297,9 +1424,9 @@ impl TransferSession {
             // Time-based buffer adaptation (matching nrzsz-go)
             let chunk_time = chunk_start.elapsed();
             self.set_last_chunk_time(chunk_time);
-            if bytes_read == buf_size && chunk_time < std::time::Duration::from_millis(500) && buf_size < self.config.max_buf_size {
+            if bytes_read == buf_size && chunk_time < std::time::Duration::from_millis(500) && buf_size < buf_cap {
                 // Double buffer if chunk was full and fast
-                buf_size = (buf_size * 2).min(self.config.max_buf_size);
+                buf_size = (buf_size * 2).min(buf_cap);
                 buf.resize(buf_size, 0);
             } else if chunk_time >= std::time::Duration::from_secs(2) && buf_size > 1024 {
                 // Reduce buffer if too slow
@@ -1408,14 +1535,19 @@ impl TransferSession {
         for file in file_list {
             if self.negotiated_protocol >= crate::protocol::PROTOCOL_V3 {
                 // V3: send full file info JSON, receive target file JSON, do prefix hash
-                let remaining_size = self.send_file_name_v3(file)?;
+                let (remaining_size, skipped) = self.send_file_name_v3(file)?;
                 
                 let remote_name = file.path_name.last().unwrap().clone();
-                if !remote_list.contains(&remote_name) {
+                if !skipped && !remote_list.contains(&remote_name) {
                     remote_list.push(remote_name);
                 }
                 
                 if file.is_dir {
+                    continue;
+                }
+                
+                // Receiver refused the file (protect / not-newer): no data follows.
+                if skipped {
                     continue;
                 }
                 
@@ -1675,7 +1807,7 @@ impl TransferSession {
             {
                 use std::os::unix::fs::OpenOptionsExt;
                 let mut open_opts = fs::OpenOptions::new();
-                open_opts.read(true).write(true).create(true);
+                open_opts.read(true).write(true).create(true).truncate(self.config.overwrite);
                 if let Some(p) = file_info.perm {
                     open_opts.mode(p | 0o600);
                 }
@@ -1686,7 +1818,7 @@ impl TransferSession {
             }
             #[cfg(not(unix))]
             {
-                let file = fs::OpenOptions::new().read(true).write(true).create(true).open(&full_path)?;
+                let file = fs::OpenOptions::new().read(true).write(true).create(true).truncate(self.config.overwrite).open(&full_path)?;
                 self.created_files.push(full_path.clone());
                 apply_perm(&full_path, file_info.perm);
                 Ok((Some(file), local_name, file_name))
@@ -1705,7 +1837,7 @@ impl TransferSession {
             {
                 use std::os::unix::fs::OpenOptionsExt;
                 let mut open_opts = fs::OpenOptions::new();
-                open_opts.read(true).write(true).create(true);
+                open_opts.read(true).write(true).create(true).truncate(self.config.overwrite);
                 if let Some(p) = file_info.perm {
                     open_opts.mode(p | 0o600);
                 }
@@ -1716,7 +1848,7 @@ impl TransferSession {
             }
             #[cfg(not(unix))]
             {
-                let file = fs::OpenOptions::new().read(true).write(true).create(true).open(&full_path)?;
+                let file = fs::OpenOptions::new().read(true).write(true).create(true).truncate(self.config.overwrite).open(&full_path)?;
                 self.created_files.push(full_path.clone());
                 apply_perm(&full_path, file_info.perm);
                 Ok((Some(file), local_name, file_name))
@@ -1810,7 +1942,9 @@ fn check_path_readable(
             archive: false,
             size: metadata.len(),
             perm,
+            mtime_ns: mtime_nanos(&metadata),
         });
+        
         
         return Ok(());
     }
@@ -1838,7 +1972,9 @@ fn check_path_readable(
         archive: false,
         size: 0,
         perm: dir_perm,
+        mtime_ns: None,
     });
+    
     
     for entry in fs::read_dir(path)? {
         let entry = entry?;
@@ -1849,4 +1985,12 @@ fn check_path_readable(
     }
     
     Ok(())
+}
+
+/// Modification time in nanoseconds since the Unix epoch, or `None` if
+/// unavailable (used for the `-Y` overwrite-newer comparison).
+fn mtime_nanos(metadata: &fs::Metadata) -> Option<i64> {
+    metadata.modified().ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos() as i64)
 }

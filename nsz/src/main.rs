@@ -65,19 +65,19 @@ struct Args {
     #[arg(short = 'a', long)]
     ascii: bool,
     
-    /// Resume interrupted file transfer (not yet supported by core)
+    /// Resume interrupted file transfer
     #[arg(long)]
     resume: bool,
     
-    /// Protect existing files: skip files that already exist (not yet supported by core)
+    /// Protect existing files: skip files that already exist
     #[arg(short = 'p', long)]
     protect: bool,
     
-    /// Window size (N bytes) for transfer (not yet supported by core)
+    /// Window size (N bytes) for transfer, capped by -B
     #[arg(short = 'w', long = "windowsize")]
     windowsize: Option<u32>,
     
-    /// Overwrite if source is newer, otherwise skip (approximated as overwrite)
+    /// Overwrite if source is newer, otherwise skip
     #[arg(short = 'Y', long = "overwrite-or-skip")]
     overwrite_or_skip: bool,
     
@@ -85,7 +85,7 @@ struct Args {
     #[arg(short = 'E', long)]
     rename: bool,
     
-    /// Append to existing files (not yet supported by core)
+    /// Append to existing files
     #[arg(short = '+', long)]
     append: bool,
 }
@@ -143,7 +143,7 @@ async fn main() -> Result<()> {
         quiet: args.quiet || args.fork,
         binary: args.binary && !args.ascii,
         directory: args.directory || args.recursive,
-        overwrite: (args.overwrite || args.overwrite_or_skip) && !args.rename,
+        overwrite: args.overwrite && !args.rename,
         compress: CompressType::parse(&args.compress),
         fork: if args.fork { Some(true) } else { None },
         ..Config::default()
@@ -155,16 +155,14 @@ async fn main() -> Result<()> {
         config.newline = "\n".to_string();
     }
     
-    // Flags that need core support not yet present
-    if args.protect {
-        eprintln!("nsz: warning: -p/--protect is not yet supported by nrzsz-core");
+    // lrzsz-style conflict-handling flags
+    config.protect = args.protect;
+    config.append = args.append;
+    config.overwrite_newer = args.overwrite_or_skip;
+    if let Some(ws) = args.windowsize {
+        config.window_size = Some(ws);
     }
-    if args.windowsize.is_some() {
-        eprintln!("nsz: warning: -w/--windowsize is not yet supported by nrzsz-core");
-    }
-    if args.append {
-        eprintln!("nsz: warning: -+/--append is not yet supported by nrzsz-core");
-    }
+    
     
     if let Some(bufsize) = &args.bufsize {
         config.max_buf_size = parse_size(bufsize)?;
@@ -268,6 +266,9 @@ async fn main() -> Result<()> {
     // Check client capabilities (matching nrzsz-go behavior)
     if args.binary && !action.support_binary.unwrap_or(true) {
         return Err(anyhow!("Binary mode not supported by client"));
+    }
+    if args.fork && !action.fork.unwrap_or(false) {
+        return Err(anyhow!("Fork mode not supported by client"));
     }
     if args.directory && !action.support_dir {
         return Err(anyhow!("Directory mode not supported by client"));

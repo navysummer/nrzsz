@@ -137,7 +137,7 @@ impl PtyProcess {
         if let Some(h) = self.stdout_handle {
             let mut n_read: u32 = 0;
             let result = unsafe {
-                windows_sys::Win32::System::Pipes::ReadFile(
+                windows_sys::Win32::Storage::FileSystem::ReadFile(
                     h as *mut _,
                     buffer.as_mut_ptr(),
                     buffer.len() as u32,
@@ -159,7 +159,7 @@ impl PtyProcess {
         if let Some(h) = self.stdin_handle {
             let mut n_written: u32 = 0;
             let result = unsafe {
-                windows_sys::Win32::System::Pipes::WriteFile(
+                windows_sys::Win32::Storage::FileSystem::WriteFile(
                     h as *mut _,
                     data.as_ptr(),
                     data.len() as u32,

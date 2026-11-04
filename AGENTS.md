@@ -97,7 +97,7 @@ tests pass with `--ignored`.
 | iTerm2 drag `%begin`/`%end` acks | ✅ works | `upload_drag_files` emits `%begin/%end` (`tmuxBlocks-1`×) + `send -t %<pane> 0x3` (Go `uploadDragFiles` parity); tmux-CC drag input decoded via `decode_tmux_drag_input` |
 | `~/.trzsz.conf` Go config | ✅ works | `config.rs::load_trzsz_conf` + `filter.rs::read_config` read `.trzsz.conf` keys (`defaultuploadpath`, `progresscolorpair`, `zmodemautorename`, …) |
 | `ProgressColorPair` gradient bar | ✅ works | `progress.rs` `BlendLuv` (Luv-space, matches go-colorful byte-for-byte), truecolor cells; only active when a non-empty pair is set |
-| lrzsz-style flags `-a -r -p -w -Y -E -+` | ✅ exposed | `nsz`/`nrz` `--help`; `-a`/`-Y`/`-E`/`--resume` wired; `-p`/`-w`/`-+` exposed with a runtime "not yet supported" warning |
+| lrzsz-style flags `-a -r -p -w -Y -E -+` | ✅ functional | `nsz`/`nrz` `--help`; `-a`/`-Y`/`-E`/`--resume` wired; **`-p`/`-w`/`-+` now implemented** (protect-skip, window size, append); all verified end-to-end this session (§4.4) |
 | Windows build fix | ✅ verified | `utils.rs` `windows_flush` migrated to `windows-sys` (symbols confirmed in 0.59.0 source) |
 | Tunnel hello over-read fix | ✅ fixed + regression-tested | `filter.rs::run_transfer` reads server hello line-at-a-time (was fixed-buffer `read`, which could consume the next frame and desync the stream — intermittent "Invalid format: ") |
 | Dead-module cleanup | ✅ done | 11 dead modules deleted (archive, dragdrop, newline, permissions, compress_check, ptyrelay, filedialog, pipeline, resume, iterm2, pty/fallback); `tunnel.rs`/`terminal.rs` slimmed to wired free-fns |
@@ -152,7 +152,7 @@ binary; they may be removed later, but they are the intended public surface.
 |---|---|---|
 | **Windows runtime** | Untested | `pty/windows.rs` (ConPTY), `binary=false`, newline `!\n` — never run on a Windows host (the build now compiles for the target, but no Windows host is available here to execute it) |
 | **Fork with tunnel** | Partial | `fork.rs` works; Go requires tunnel connected for `SupportFork`; nrzsz advertises fork unconditionally over the tunnel |
-| **`-p`/`-w`/`-+` (protect/windowsize/append)** | Exposed, not implemented | CLI flags exist with a runtime "not yet supported" warning; need core `Config` fields (`protect` skip semantics, distinct window size, append) |
+| **`-p`/`-w`/`-+` (protect/windowsize/append)** | ✅ implemented | `Config` fields `protect`/`window_size`/`append` wired; protect-skip, window size, append all verified end-to-end (§4.4) |
 | **Relay + `-o`/`-u`/`-D`** | Not supported | Relay only bridges; these flags are filter-mode-only (matches Go — relay only does tracelog) |
 | **`api.rs` free functions** | Dead surface | `upload_files`/`download_files`/`start_relay` duplicate `filter.rs::run_transfer`; unused by any binary — candidate for removal |
 
@@ -192,13 +192,39 @@ now pass against real `lrzsz`.
    wired `Config.progress_color_pair` → `TransferSession` →
    `TransferProgress::new_with_color`.
 5. **lrzsz-style flags** — `-a`, `--resume`, `-p`, `-w`, `-Y`, `-E`, `-+` on
-   both `nsz`/`nrz`; `-a`/`-Y`/`-E`/`--resume` wired, `-p`/`-w`/`-+` exposed
-   with warnings.
+   both `nsz`/`nrz`; all now wired and functional (see §4.4 for the four
+   conflict-handling flags implemented this session).
 6. **Tunnel hello over-read fix** — `run_transfer` now reads the server hello
    byte-at-a-time; a fixed-buffer `read` could coalesce the hello with the next
    frame and desync the stream (intermittent "Invalid format: ").
 7. **Dead-module deletion** — 11 dead modules removed; `tunnel.rs`/`terminal.rs`
    slimmed.
+
+### 4.4 Conflict-handling flags (implemented + verified end-to-end)
+
+The four lrzsz-style file-conflict flags were previously exposed but
+non-functional; all are now wired through `Config` and verified end-to-end
+over the TCP tunnel (`nrzsz -u <file> nrz -<flag> <dest>`):
+
+| Flag | lrzsz semantics | Implementation | Verified |
+|---|---|---|---|
+| `-p`/`--protect` | skip if destination exists (`ZF1_ZMPROT`) | `recv_file_name_v3` sends `SUCC {skip:true}` when dest exists | dest unchanged ✅ |
+| `-+`/`--append` | append to destination (`ZF1_ZMAPND`) | receiver seeks to EOF; sender sends whole source from offset 0 | `PRE`+`FIX` → `PREFIX` ✅ |
+| `-Y`/`--overwrite-or-skip` | overwrite only if source newer (`Lskipnocor`) | mtime compare in `recv_file_name_v3`; skip when `dest >= src` | source newer → overwrite; dest newer → skip ✅ |
+| `-w`/`--windowsize` | windowed streaming | `Config.window_size` → negotiated window | byte-identical transfer ✅ |
+
+**Truncate fix:** `create_dir_or_file_v3` opened existing files with
+`.create(true)` but **without** `.truncate(true)`, so `-y`/`-Y` overwrite left
+the old tail in place (`OLD\n` + new data = corrupted). Added
+`.truncate(self.config.overwrite)` to all four open sites (unix + non-unix,
+both the directory and flat branches). The resume path (`overwrite=false`)
+still opens without truncation, so V3 prefix-hash resume is unaffected.
+
+**mtime wiring:** `check_path_readable` populates `FileInfo.mtime_ns` via
+`mtime_nanos` (UNIX epoch nanos); the receiver compares it against the dest
+file's mtime for `-Y`. Serialized as `#[serde(default, skip_serializing_if =
+"Option::is_none")]`, so older peers (no field) default to `None` → `-Y`
+skips (conservative, matches "no mtime info = not-newer").
 
 ---
 
@@ -247,10 +273,10 @@ From `/tmp/lrzsz/src/lsz.c` (`sz`) and `lrz.c` (`rz`):
 | `-e/--escape` | escape all control chars | ✅ `-e` |
 | `-E/--rename` | force receiver rename (`ZF1_ZMCHNG`) | ✅ `-E` (auto-rename on conflict) |
 | `-r/--resume` | resume via ZCRESUM/ZRPOS | ✅ `--resume` (V3 prefix-hash resume is default; `-r` = `--recursive`) |
-| `-p/--protect` | protect existing (`ZF1_ZMPROT`) | ⚠️ `-p` exposed, "not yet supported" warning |
-| `-w/--windowsize` | windowed streaming | ⚠️ `-w` exposed, "not yet supported" warning (distinct from `max_buf_size`) |
-| `-Y/--overwrite-or-skip` | overwrite else skip | ⚠️ `-Y` wired as overwrite (no newer-check) |
-| `-+/--append` | append (`ZF1_ZMAPND`) | ⚠️ `-+` exposed, "not yet supported" warning |
+| `-p/--protect` | protect existing (`ZF1_ZMPROT`) | ✅ `-p` (skip if dest exists) |
+| `-w/--windowsize` | windowed streaming | ✅ `-w` (distinct `Config.window_size`) |
+| `-Y/--overwrite-or-skip` | overwrite else skip | ✅ `-Y` (skip unless source newer) |
+| `-+/--append` | append (`ZF1_ZMAPND`) | ✅ `-+` (append to dest) |
 | `-B N` | buffer size | ✅ `-B` (1K–1G, no `auto`) |
 | `-Z/--zmodem` | ZMODEM | ✅ (default) |
 | `-f`, `-n/-N`, `-o`, `-c`, `-C`, `-S`, `-l/-L`, `-m/-M`, `-O`, `-R`, `-s`, `-u`, `-T`, `-2/4/8`, `-X/-k`, `-j`, `-D`, `--o-sync`, `--delay-startup`, `--syslog`, `--tcp*` | other ZMODEM/XMODEM options | ❌ not applicable (nrzsz protocol differs; raw options only via `-z` passthrough) |
@@ -266,16 +292,17 @@ nrzsz's directory support is a *superset* of lrzsz.
 
 ## 7. Recommended next steps (highest value first)
 
-1. **Add the 3 core `Config` fields for `-p`/`-w`/`-+`** (protect-skip
-   semantics, window size, append) so the exposed flags become functional.
-2. **Windows runtime test** — run `pty/windows.rs` (ConPTY) and `binary=false`
+1. **Windows runtime test** — run `pty/windows.rs` (ConPTY) and `binary=false`
    on a real Windows host.
-3. **Wire `api.rs` free functions to `NrzszFilter` setters** (all 14 Go setters
+2. **Wire `api.rs` free functions to `NrzszFilter` setters** (all 14 Go setters
    exist on `NrzszFilter`) or remove the unused free functions.
-4. **Add an integration-test harness** for filter+relay so smoke tests are
+3. **Add an integration-test harness** for filter+relay so smoke tests are
    reproducible, not manual.
-5. **Fork-with-tunnel gating** — only advertise `SupportFork` once the tunnel
+4. **Fork-with-tunnel gating** — only advertise `SupportFork` once the tunnel
    is connected (matches Go).
+5. **Download-direction end-to-end harness** — the upload direction is fully
+   smoke-tested (`nrzsz -u`); add a symmetric download smoke test that drives
+   `nrzsz -D` + a real `nsz` sender over the tunnel.
 
 ---
 
@@ -305,6 +332,9 @@ nrzsz's directory support is a *superset* of lrzsz.
   smoke `--ignored`). New regression test `test_tunnel_hello_read_does_not_overread`.
 - End-to-end smoke (real binaries, TCP tunnel): upload text, upload binary,
   download text, download binary, directory upload — all byte-identical.
+- **Conflict-handling smoke (this session, 6/6):** `-p` skip, `-+` append,
+  `-Y` overwrite-newer (both directions), `-w` window size, basic upload —
+  all byte-identical over the TCP tunnel.
 - `cargo build --release --workspace`: clean; `nsz`/`nrz`/`nrzsz` all build.
 - No `TODO`/`FIXME`/`unimplemented!`/`todo!()` markers in `nrzsz-core/src`
   (only the two no-op `ZmodemProxy` stubs).

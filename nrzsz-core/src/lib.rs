@@ -30,6 +30,4 @@ pub use filter::NrzszFilter;
 // Re-export api with explicit names
 pub use api::NrzszOptions;
 pub use api::TransferStateHandler;
-pub use api::upload_files as api_upload_files;
-pub use api::download_files as api_download_files;
-pub use api::start_relay as api_start_relay;
+pub use api::TransferState;

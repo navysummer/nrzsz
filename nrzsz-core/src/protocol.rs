@@ -270,6 +270,18 @@ pub struct Config {
     pub client_files: Vec<String>,
     #[serde(default)]
     pub progress_color_pair: (String, String),
+    /// Skip files that already exist at the destination (lrzsz `-p`/`ZF1_ZMPROT`).
+    #[serde(default)]
+    pub protect: bool,
+    /// Append to existing destination files (lrzsz `-+`/`ZF1_ZMAPND`).
+    #[serde(default)]
+    pub append: bool,
+    /// Optional transfer window size cap in bytes (lrzsz `-w`/`Txwindow`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_size: Option<u32>,
+    /// Overwrite only when the source is newer, else skip (lrzsz `-Y`/`Lskipnocor`).
+    #[serde(default)]
+    pub overwrite_newer: bool,
 }
 
 impl Config {
@@ -426,6 +438,10 @@ impl Default for Config {
             fork: None,
             client_files: Vec::new(),
             progress_color_pair: (String::new(), String::new()),
+            protect: false,
+            append: false,
+            window_size: None,
+            overwrite_newer: false,
         }
     }
 }
@@ -443,6 +459,9 @@ pub struct FileInfo {
     pub size: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub perm: Option<u32>,
+    /// Modification time in nanoseconds since epoch (for `-Y` newer-check).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mtime_ns: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -463,6 +482,14 @@ pub struct DirectoryInfo {
 pub struct TargetFile {
     pub name: String,
     pub size: i64,
+    /// Set when the receiver skipped the file (protect / not-newer); the
+    /// sender must not transmit data for it.
+    #[serde(default)]
+    pub skip: bool,
+    /// Set when the receiver opened an existing file in append mode; the
+    /// sender must seek to `size` and send only the tail (no prefix hash).
+    #[serde(default)]
+    pub append: bool,
 }
 
 // V3+ prefix hash for resume support
