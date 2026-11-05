@@ -1458,6 +1458,12 @@ mod tests {
 
     #[test]
     fn test_process_input_drag_uploads_command() {
+        // Create a real file so `detect_file_path` (fs::metadata, matching Go's
+        // os.Stat) recognizes the dragged path.
+        let dir = std::env::temp_dir().join(format!("nrzsz_drag_test_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let file_path = dir.join("a.txt");
+        std::fs::write(&file_path, b"drag").unwrap();
         let mut filter = NrzszFilter::new(Config::default());
         filter.enable_dragfile = true;
         // Shared buffer writer so we can inspect what drag upload writes.
@@ -1468,8 +1474,8 @@ mod tests {
         )));
         filter.server_in = writer;
 
-        let paste = b"\x1b[200~/tmp/nrzsz_t/mydir/a.txt\x1b[201~";
-        let result = filter.process_input(paste);
+        let paste = format!("\x1b[200~{}\x1b[201~", file_path.display()).into_bytes();
+        let result = filter.process_input(&paste);
         // Drag detected → consume input, send "trz\r" to server stdin.
         assert!(result.is_empty());
         std::thread::sleep(std::time::Duration::from_millis(800));
@@ -1477,10 +1483,14 @@ mod tests {
         let s = String::from_utf8_lossy(&guard);
         // Non-tmux: Ctrl-C interrupt (0x03) then the command (Go uploadDragFiles).
         assert_eq!(s, "\u{3}trz\r");
+        let _ = std::fs::remove_file(&file_path);
     }
 
     #[test]
     fn test_process_input_drag_uploads_command_with_dir() {
+        // Real directory so the drag is detected with `has_dir` (Go os.Stat).
+        let dir = std::env::temp_dir().join(format!("nrzsz_drag_dir_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
         let mut filter = NrzszFilter::new(Config::default());
         filter.enable_dragfile = true;
         let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
@@ -1490,8 +1500,8 @@ mod tests {
         )));
         filter.server_in = writer;
 
-        let paste = b"\x1b[200~/tmp/nrzsz_t/mydir\x1b[201~";
-        let result = filter.process_input(paste);
+        let paste = format!("\x1b[200~{}\x1b[201~", dir.display()).into_bytes();
+        let result = filter.process_input(&paste);
         assert!(result.is_empty());
         std::thread::sleep(std::time::Duration::from_millis(800));
         let guard = buf.lock().unwrap();
