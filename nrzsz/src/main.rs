@@ -131,6 +131,7 @@ fn main() -> Result<()> {
     filter.set_enable_osc52(args.osc52);
     filter.set_enable_zmodem(args.zmodem);
     filter.set_zmodem_auto_rename(args.rename);
+    filter.set_enable_dragfile(args.dragfile);
     filter.start()?;
     let stopped = filter.stopped_flag();
     let is_transferring = filter.is_transferring_flag();

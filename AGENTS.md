@@ -151,10 +151,13 @@ binary; they may be removed later, but they are the intended public surface.
 | Area | Status | Evidence |
 |---|---|---|
 | **Windows runtime** | Untested | `pty/windows.rs` (ConPTY), `binary=false`, newline `!\n` — never run on a Windows host (the build now compiles for the target, but no Windows host is available here to execute it) |
-| **Fork with tunnel** | Partial | `fork.rs` works; Go requires tunnel connected for `SupportFork`; nrzsz advertises fork unconditionally over the tunnel |
+| **Fork with tunnel** | ✅ fixed | `send_action` now advertises `tunnel: Some(tunnel_connected)`, so `use_tunnel` is true over the tunnel and fork actually gates (§4.5) |
 | **`-p`/`-w`/`-+` (protect/windowsize/append)** | ✅ implemented | `Config` fields `protect`/`window_size`/`append` wired; protect-skip, window size, append all verified end-to-end (§4.4) |
 | **Relay + `-o`/`-u`/`-D`** | Not supported | Relay only bridges; these flags are filter-mode-only (matches Go — relay only does tracelog) |
 | **`api.rs` free functions** | Dead surface | `upload_files`/`download_files`/`start_relay` duplicate `filter.rs::run_transfer`; unused by any binary — candidate for removal |
+| **`-Y` vs lrzsz semantics** | Divergence | nrzsz `-Y` = "overwrite if source newer"; lrzsz `-Y` = "clobber + skip-if-not-found" (`ZF1_ZMSKNOLOC`). Deliberate; nrzsz targets Go, which has no `-Y`. |
+| **V4 directory archive** | Not implemented | Go groups a directory's files into one streamed `SubFiles` archive entry; nrzsz sends each file individually (correct, only a wire-size optimization) |
+| **Non-tunnel fallback** | Design choice | nrzsz always transfers over the TCP tunnel; Go can fall back to raw terminal streams when no connector is set |
 
 ---
 
@@ -226,6 +229,51 @@ file's mtime for `-Y`. Serialized as `#[serde(default, skip_serializing_if =
 "Option::is_none")]`, so older peers (no field) default to `None` → `-Y`
 skips (conservative, matches "no mtime info = not-newer").
 
+### 4.5 This session (fresh comparison vs trzsz-go + lrzsz)
+
+Found via a fresh source-level comparison against `/tmp/trzsz-go/trzsz` and
+`/tmp/lrzsz/src`. All fixed and verified end-to-end:
+
+1. **Tunnel never advertised** — `send_action` always sent `tunnel: None`, so
+   the server's `use_tunnel = action.tunnel.unwrap_or(false)` was **always
+   false**. Consequence: fork (`SupportFork`) and tunnel binary mode never
+   activated over the tunnel. Fixed: `tunnel: Some(tunnel_connected)`
+   (`transfer.rs::send_action`). Verified: `nrz -f` fork and binary-over-tunnel
+   both work now (7/7 feature smoke).
+2. **`send_config` local-config desync** — the receiver advertised
+   `binary=true` (forced by tunnel) to the client but its own `recv_*` used
+   `config.binary` from args (`false`), so client sent binary-path data while
+   the receiver read base64 → "Invalid padding". Fixed: `send_config` now
+   unmarshals the sent `cfg_map` back into `self.config` (mirrors Go
+   `sendConfig`, which sets `transferConfig` from the marshaled cfgMap).
+3. **`-d/--dragfile` no-op** — `args.dragfile` was parsed but
+   `set_enable_dragfile` was never called, so drag detection never ran. Fixed:
+   wired `filter.set_enable_dragfile(args.dragfile)` in `nrzsz/src/main.rs`.
+4. **Progress color pair dead** — `filter.progress_color_pair` was stored but
+   never reached `Config.progress_color_pair`, so the gradient never showed in
+   the CLI path. Fixed: `set_progress_color_pair` now whitespace-splits and
+   populates the transfer `Config` (matching Go `newTextProgressBar`).
+5. **Auto-upload dirs** — `allowedautouploaddirs` was not shlex-split
+   (whole value = one dir); empty dirs were permissive (Go errors); and the
+   `-u` path bypassed the allowed-dir check. Fixed all three
+   (`filter.rs::read_config`, `check_auto_upload_allowed`, `upload_files_to`).
+6. **Drag tmux command** — in tmux `-CC` mode the command was written raw
+   (not hex-encoded/`send -t`-wrapped), `-d` was always appended (Go gates on
+   `uploadCommandIsNotTrz`), and non-tmux mode omitted the Ctrl-C (`0x03`)
+   interrupt byte. Fixed all three (`filter.rs::upload_drag_files` +
+   `set_drag_file_upload_command`); added the `upload_command_is_not_trz`
+   field.
+7. **`-c yes` force-compress** — the sender used `compress_if_profitable`
+   even for `-c yes`, so a small/incompressible file was sent uncompressed
+   while the receiver (config `compress=Yes`) assumed zstd → "Unknown frame
+   descriptor". Fixed: `-c yes` now always compresses (Go `isCompressFixed`),
+   in both `send_file_data` and `send_file_data_with_compress`.
+
+**Verification:** `cargo build --release --workspace` = 0 warnings;
+`cargo test --release --workspace` = 64 lib + 13 protocol, 0 failed;
+8/8 feature smoke (text, 3 MB binary, directory, fork, `-c yes` compress,
+resume, `-Y`, `-+`). The 2 zmodem smoke tests pass with `--ignored`.
+
 ---
 
 ## 5. Gap analysis vs trzsz-go v1.2.0
@@ -236,9 +284,9 @@ Remaining differences vs trzsz-go:
 | trzsz-go feature | nrzsz | Notes |
 |---|---|---|
 | tmux control mode (`-CC`) | ✅ now wired | `TmuxOutputRedirect` + trigger prefix parsing + drag `%begin`/`%end` |
-| iTerm2 drag `%begin`/`%end` | ✅ now wired | `upload_drag_files` (Go `uploadDragFiles` parity) |
+| iTerm2 drag `%begin`/`%end` | ✅ now wired | `upload_drag_files` (Go `uploadDragFiles` parity); **tmux-CC command now hex-encoded + `send -t`-wrapped (§4.5)** |
 | `~/.trzsz.conf` (Go keys) | ✅ now read | `config.rs::load_trzsz_conf` + `filter.rs::read_config` |
-| `ProgressColorPair` gradient | ✅ now implemented | `BlendLuv` matches go-colorful byte-for-byte |
+| `ProgressColorPair` gradient | ✅ now reaches progress bar | `BlendLuv` matches go-colorful byte-for-byte; `set_progress_color_pair` now populates the transfer `Config` (§4.5) |
 | Go embedding setters | ⚠️ on `NrzszFilter` | all 14 setters exist on `NrzszFilter` (`filter.rs`); `api.rs` exposes only a parallel `NrzszOptions` surface |
 | zmodem auto-rename `-E` | ⚠️ partial | `ZmodemProxy` stubs retained; auto-rename via `resolve_dest` exists |
 | Windows ConPTY | ⚠️ build fixed, runtime untested | `windows_flush` migrated; no Windows host to execute |
@@ -328,11 +376,13 @@ nrzsz's directory support is a *superset* of lrzsz.
 
 ## 9. Test / verification status
 
-- `cargo test --workspace`: **64 lib + 11 protocol, 0 failed** (plus 2 zmodem
-  smoke `--ignored`). New regression test `test_tunnel_hello_read_does_not_overread`.
-- End-to-end smoke (real binaries, TCP tunnel): upload text, upload binary,
-  download text, download binary, directory upload — all byte-identical.
-- **Conflict-handling smoke (this session, 6/6):** `-p` skip, `-+` append,
+- `cargo test --workspace`: **64 lib + 13 protocol, 0 failed** (plus 2 zmodem
+  smoke `--ignored`). New regression tests `test_tunnel_hello_read_does_not_overread`,
+  `test_send_action_advertises_tunnel`, `test_send_action_no_tunnel_advertises_false`.
+- **Comprehensive smoke (this session, 8/8):** upload text, 3 MB binary,
+  directory recursive, fork `-f`, `-c yes` compress, `--resume`, `-Y`, `-+`
+  — all byte-identical over the TCP tunnel.
+- **Conflict-handling smoke (prior session, 6/6):** `-p` skip, `-+` append,
   `-Y` overwrite-newer (both directions), `-w` window size, basic upload —
   all byte-identical over the TCP tunnel.
 - `cargo build --release --workspace`: clean; `nsz`/`nrz`/`nrzsz` all build.

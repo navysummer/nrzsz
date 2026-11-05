@@ -160,3 +160,47 @@ fn test_recv_windows_newline() {
     cursor.read_exact(&mut payload).unwrap();
     assert_eq!(&payload, b"HELLO");
 }
+
+#[test]
+fn test_send_action_advertises_tunnel() {
+    // Regression: the Action sent by send_action must advertise
+    // `tunnel: Some(tunnel_connected)` so the server's use_tunnel (and the
+    // fork/binary gating that depends on it) works over the tunnel.
+    let action = Action {
+        lang: "rs".to_string(),
+        confirm: true,
+        version: "0.1.0".to_string(),
+        support_dir: true,
+        protocol: PROTOCOL_VERSION,
+        newline: "\n".to_string(),
+        tunnel: Some(true),
+        fork: Some(true),
+        tmuxcc: None,
+        support_binary: Some(true),
+    };
+    let json = serde_json::to_string(&action).unwrap();
+    assert!(json.contains("\"tunnel\":true"));
+    assert!(json.contains("\"fork\":true"));
+}
+
+#[test]
+fn test_send_action_no_tunnel_advertises_false() {
+    // When the tunnel is NOT connected, tunnel must be Some(false) and fork
+    // Some(false) — matching Go's sendAction (which only sets both true on a
+    // connected tunnel).
+    let action = Action {
+        lang: "rs".to_string(),
+        confirm: true,
+        version: "0.1.0".to_string(),
+        support_dir: true,
+        protocol: PROTOCOL_VERSION,
+        newline: "\n".to_string(),
+        tunnel: Some(false),
+        fork: Some(false),
+        tmuxcc: None,
+        support_binary: Some(true),
+    };
+    let json = serde_json::to_string(&action).unwrap();
+    assert!(json.contains("\"tunnel\":false"));
+    assert!(json.contains("\"fork\":false"));
+}

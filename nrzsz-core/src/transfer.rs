@@ -200,7 +200,8 @@ impl TransferSession {
             support_dir: true,
             protocol: PROTOCOL_VERSION,
             newline: "\n".to_string(),
-            tunnel: None,
+            // Go: TunnelConnected is advertised only when the tunnel is connected.
+            tunnel: Some(tunnel_connected),
             // Go: SupportFork is advertised only when the tunnel is connected.
             fork: Some(tunnel_connected),
             tmuxcc: None,
@@ -361,6 +362,15 @@ impl TransferSession {
         }
         
         let config_json = serde_json::to_string(&cfg_map)?;
+        // The sender advertises its effective transfer config (e.g. binary
+        // forced by the tunnel). Mirror Go's sendConfig, which unmarshals the
+        // sent cfgMap back into transferConfig so the local side uses the same
+        // settings it advertised.
+        if let Ok(cfg) = serde_json::from_str::<Config>(&config_json) {
+            let newline = self.config.newline.clone();
+            self.config = cfg;
+            self.config.newline = newline;
+        }
         send_string(&mut self.stdout, "CFG", &config_json, &self.config.newline)?;
         Ok(())
     }
@@ -1257,7 +1267,12 @@ impl TransferSession {
             let data = &buf[..bytes_read];
             
             let (compressed_data, _was_compressed) = if compress_type != crate::compress::CompressAlgo::None {
-                crate::compress::compress_if_profitable(data, compress_type)?
+                if self.config.compress == crate::protocol::CompressType::Yes {
+                    // -c yes forces compression (Go isCompressFixed): bypass profitability.
+                    (crate::compress::compress_data(data, compress_type)?, true)
+                } else {
+                    crate::compress::compress_if_profitable(data, compress_type)?
+                }
             } else {
                 (data.to_vec(), false)
             };
@@ -1400,7 +1415,12 @@ impl TransferSession {
             let data = &buf[..bytes_read];
             
             let (compressed_data, _was_compressed) = if compress_type != crate::compress::CompressAlgo::None {
-                crate::compress::compress_if_profitable(data, compress_type)?
+                if self.config.compress == crate::protocol::CompressType::Yes {
+                    // -c yes forces compression (Go isCompressFixed): bypass profitability.
+                    (crate::compress::compress_data(data, compress_type)?, true)
+                } else {
+                    crate::compress::compress_if_profitable(data, compress_type)?
+                }
             } else {
                 (data.to_vec(), false)
             };

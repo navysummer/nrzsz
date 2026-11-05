@@ -308,6 +308,7 @@ pub struct NrzszFilter {
     allowed_auto_upload_dirs: Vec<String>,
     default_upload_path: String,
     drag_file_upload_command: String,
+    upload_command_is_not_trz: bool,
     one_time_upload_files: Vec<String>,
     one_time_upload_result: Option<std::sync::mpsc::Sender<Result<()>>>,
     skip_upload_command: Arc<AtomicBool>,
@@ -342,6 +343,7 @@ impl NrzszFilter {
             allowed_auto_upload_dirs: Vec::new(),
             default_upload_path: String::new(),
             drag_file_upload_command: String::new(),
+            upload_command_is_not_trz: false,
             one_time_upload_files: Vec::new(),
             one_time_upload_result: None,
             skip_upload_command: Arc::new(AtomicBool::new(false)),
@@ -390,6 +392,12 @@ impl NrzszFilter {
 
     pub fn set_progress_color_pair(&mut self, color_pair: String) {
         self.progress_color_pair = color_pair;
+        // Populate the transfer Config so the gradient reaches the progress bar
+        // (matching Go's newTextProgressBar, which splits on whitespace).
+        let colors: Vec<&str> = self.progress_color_pair.split_whitespace().collect();
+        if colors.len() == 2 {
+            self.config.progress_color_pair = (colors[0].to_string(), colors[1].to_string());
+        }
     }
 
     pub fn set_redraw_screen_func<F>(&mut self, func: F)
@@ -441,6 +449,14 @@ impl NrzszFilter {
     }
 
     pub fn set_drag_file_upload_command(&mut self, command: String) {
+        // Go: uploadCommandIsNotTrz is true when the command's base name is not
+        // `trz`/`trz.exe` (filter.go SetDragFileUploadCommand). Compute before
+        // moving `command` into the field.
+        let base = std::path::Path::new(&command)
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+        self.upload_command_is_not_trz = !base.is_empty() && base != "trz" && base != "trz.exe";
         self.drag_file_upload_command = command;
     }
 
@@ -496,7 +512,9 @@ impl NrzszFilter {
                 }
                 match name.as_str() {
                     "allowedautouploaddirs" if self.allowed_auto_upload_dirs.is_empty() => {
-                        let _ = self.set_allowed_auto_upload_dirs(&[value]);
+                        // Go shlex-splits a space-separated list of dirs (filter.go SetAllowedAutoUploadDirs).
+                        let dirs: Vec<String> = value.split_whitespace().map(|s| s.to_string()).collect();
+                        let _ = self.set_allowed_auto_upload_dirs(&dirs);
                     }
                     "defaultuploadpath" if self.default_upload_path.is_empty() => {
                         self.set_default_upload_path(value);
@@ -770,6 +788,7 @@ impl NrzszFilter {
                 let tmux_pane_id = drag_info.tmux_pane_id.clone();
                 let tmux_blocks = drag_info.tmux_blocks;
                 let upload_cmd = self.drag_file_upload_command.clone();
+                let cmd_not_trz = self.upload_command_is_not_trz;
                 let is_transferring = self.is_transferring.clone();
                 let interrupting = self.interrupting.clone();
                 let skip = self.skip_upload_command.clone();
@@ -778,7 +797,7 @@ impl NrzszFilter {
                 let server_in = self.server_in.clone();
 
                 std::thread::spawn(move || {
-                    upload_drag_files(&files, has_dir, &upload_cmd,
+                    upload_drag_files(&files, has_dir, &upload_cmd, cmd_not_trz,
                                       &is_transferring, &interrupting, &skip, &current_cmd,
                                       server_in, &tmux_pane_id, tmux_blocks);
                 });
@@ -973,21 +992,20 @@ impl TransferCtx {
             // config.client_files carries the names the server expects, but the
             // real paths come from the client's upload_files (-u).
             if !self.upload_files.is_empty() {
+                self.check_auto_upload_allowed(&self.upload_files)?;
                 self.upload_files.clone()
             } else if !config.client_files.is_empty() {
-                if !self.allowed_auto_upload_dirs.is_empty() {
-                    self.check_auto_upload_allowed(&config.client_files)?;
-                }
+                self.check_auto_upload_allowed(&config.client_files)?;
                 config.client_files.clone()
             } else {
                 return Err(anyhow!("No files specified to upload"));
             }
         } else if !self.upload_files.is_empty() {
+            // R/D mode: client explicitly chose files via -u; no allowed-dir gate
+            // (matches Go, where -u in R/D mode bypasses checkAutoUploadAllowed).
             self.upload_files.clone()
         } else if !config.client_files.is_empty() {
-            if !self.allowed_auto_upload_dirs.is_empty() {
-                self.check_auto_upload_allowed(&config.client_files)?;
-            }
+            self.check_auto_upload_allowed(&config.client_files)?;
             config.client_files.clone()
         } else {
             return Err(anyhow!("No upload files specified"));
@@ -1011,17 +1029,17 @@ impl TransferCtx {
     }
 
     fn check_auto_upload_allowed(&self, files: &[String]) -> Result<()> {
+        // Go errors when no allowed dirs are configured (filter.go checkAutoUploadAllowed).
         if self.allowed_auto_upload_dirs.is_empty() {
-            return Ok(());
+            return Err(anyhow!("Auto upload is disabled: no allowed upload directories configured"));
         }
         for file in files {
             let path = std::path::Path::new(file);
-            let abs = if path.is_absolute() {
-                path.to_path_buf()
-            } else {
-                std::env::current_dir()?.join(path)
-            };
-            let canonical = abs.canonicalize().unwrap_or(abs);
+            // Go requires absolute paths for auto upload.
+            if !path.is_absolute() {
+                return Err(anyhow!("File path must be absolute: {}", file));
+            }
+            let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
             let canonical_str = canonical.to_string_lossy().to_string();
             let allowed = self.allowed_auto_upload_dirs.iter().any(|dir| {
                 is_path_within_dir(&canonical_str, dir)
@@ -1228,6 +1246,7 @@ fn upload_drag_files(
     files: &[String],
     has_dir: bool,
     upload_command: &str,
+    cmd_not_trz: bool,
     is_transferring: &Arc<AtomicBool>,
     interrupting: &Arc<AtomicBool>,
     skip_upload_command: &Arc<AtomicBool>,
@@ -1264,6 +1283,11 @@ fn upload_drag_files(
         drop(w);
         std::thread::sleep(std::time::Duration::from_millis(300));
     } else {
+        // Non-tmux: interrupt with Ctrl-C (0x03), matching Go's uploadDragFiles.
+        let mut w = server_in.lock().unwrap();
+        let _ = w.write_all(&[0x03]);
+        let _ = w.flush();
+        drop(w);
         std::thread::sleep(std::time::Duration::from_millis(300));
     }
     interrupting.store(false, Ordering::SeqCst);
@@ -1275,7 +1299,7 @@ fn upload_drag_files(
     } else {
         upload_command.to_string()
     };
-    if has_dir {
+    if has_dir && !cmd_not_trz {
         command = format!("{} -d", command);
     }
 
@@ -1285,6 +1309,13 @@ fn upload_drag_files(
     // Send the trz command to server stdin (matching Go's writeAll(filter.serverIn, buffer)).
     let mut buffer = command.clone().into_bytes();
     buffer.push(b'\r');
+    // In tmux -CC control mode, hex-encode the command and wrap it in a
+    // `send -t %<pane>` so it routes to the correct pane (Go convertToHexStrings).
+    if !tmux_pane_id.is_empty() {
+        let hex = crate::tmuxcc::convert_to_hex_strings(&buffer);
+        let wrapped = format!("send -t %{} {}\r", tmux_pane_id, hex);
+        buffer = wrapped.into_bytes();
+    }
     let mut w = server_in.lock().unwrap();
     if w.write_all(&buffer).is_ok() {
         let _ = w.flush();
@@ -1444,7 +1475,8 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(800));
         let guard = buf.lock().unwrap();
         let s = String::from_utf8_lossy(&guard);
-        assert_eq!(s, "trz\r");
+        // Non-tmux: Ctrl-C interrupt (0x03) then the command (Go uploadDragFiles).
+        assert_eq!(s, "\u{3}trz\r");
     }
 
     #[test]
@@ -1464,7 +1496,8 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(800));
         let guard = buf.lock().unwrap();
         let s = String::from_utf8_lossy(&guard);
-        assert_eq!(s, "trz -d\r");
+        // Non-tmux: Ctrl-C interrupt (0x03) then the command with -d.
+        assert_eq!(s, "\u{3}trz -d\r");
     }
 
     /// Simple writer that appends to a shared Vec<u8>.
