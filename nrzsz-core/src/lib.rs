@@ -30,4 +30,4 @@ pub use filter::NrzszFilter;
 // Re-export api with explicit names
 pub use api::NrzszOptions;
 pub use api::TransferStateHandler;
-pub use api::TransferState;
+pub use api::TransferStateCallback;

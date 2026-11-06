@@ -42,20 +42,92 @@ pub struct TransferSession {
     file_name_map: std::collections::HashMap<u32, String>,
 }
 
+/// Shared stop control for a transfer session. The wrapper (SIGINT, tmux-CC
+/// Ctrl+C) holds a clone and can stop a running session in place: set the
+/// stopped / stop-and-delete flags and wake any thread blocked on a protocol
+/// read (matching Go's `trzszTransfer.stopTransferringFiles(stopAndDelete)`,
+/// which the filter reaches via `filter.StopTransferringFiles`).
+pub struct TransferStop {
+    stopped: Arc<AtomicBool>,
+    stop_and_delete: Arc<AtomicBool>,
+    buffer: Arc<NrzszBuffer>,
+}
+
+impl TransferStop {
+    pub fn new() -> Arc<Self> {
+        let buffer = Arc::new(NrzszBuffer::new());
+        Arc::new(Self {
+            stopped: Arc::new(AtomicBool::new(false)),
+            stop_and_delete: Arc::new(AtomicBool::new(false)),
+            buffer,
+        })
+    }
+
+    pub fn stop(&self, stop_and_delete: bool) {
+        if self.stopped.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+            return;
+        }
+        self.stop_and_delete.store(stop_and_delete, Ordering::SeqCst);
+        self.buffer.stop_buffer();
+    }
+
+    pub fn is_stopped(&self) -> bool {
+        self.stopped.load(Ordering::SeqCst) || is_stopped()
+    }
+
+    pub fn is_stop_and_delete(&self) -> bool {
+        self.stop_and_delete.load(Ordering::SeqCst)
+    }
+
+    pub fn buffer(&self) -> &Arc<NrzszBuffer> {
+        &self.buffer
+    }
+
+
+    /// The shared stopped flag (same Arc the session checks in `is_stopped`/`check_stop`).
+    pub fn stopped_flag(&self) -> Arc<AtomicBool> {
+        self.stopped.clone()
+    }
+
+    /// The shared stop-and-delete flag.
+    pub fn stop_and_delete_flag(&self) -> Arc<AtomicBool> {
+        self.stop_and_delete.clone()
+    }
+}
+
+impl Default for TransferStop {
+    fn default() -> Self {
+        Self {
+            stopped: Arc::new(AtomicBool::new(false)),
+            stop_and_delete: Arc::new(AtomicBool::new(false)),
+            buffer: Arc::new(NrzszBuffer::new()),
+        }
+    }
+}
+
 impl TransferSession {
     pub fn new(config: Config, stdin: Box<dyn Read + Send + 'static>, stdout: Box<dyn Write>) -> Self {
-        let buffer = Arc::new(NrzszBuffer::new());
+        Self::new_with_stop(config, stdin, stdout, TransferStop::new())
+    }
+
+    /// Build a session that shares its stop/buffer state with `stop`, so the
+    /// wrapper (SIGINT / tmux-CC Ctrl+C) can stop a running session in place by
+    /// calling `stop.stop(...)` on the same handle (Go's StopTransferringFiles).
+    pub fn new_with_stop(config: Config, stdin: Box<dyn Read + Send + 'static>, stdout: Box<dyn Write>, stop: Arc<TransferStop>) -> Self {
+        let buffer = stop.buffer().clone();
         buffer.set_new_timeout(std::time::Duration::from_secs(config.timeout as u64));
         let buffer_reader = Box::new(BufferReader::new(buffer.clone()));
         start_stdin_reader(stdin, buffer.clone());
+        let stopped = stop.stopped_flag();
+        let stop_and_delete = stop.stop_and_delete_flag();
         Self {
             config,
             stdin: buffer_reader,
             stdout,
             _buffer: buffer,
             created_files: Vec::new(),
-            stopped: Arc::new(AtomicBool::new(false)),
-            stop_and_delete: Arc::new(AtomicBool::new(false)),
+            stopped,
+            stop_and_delete,
             pausing: Arc::new(AtomicBool::new(false)),
             pause_idx: Arc::new(AtomicU32::new(0)),
             pause_begin_time: Arc::new(AtomicI64::new(0)),
@@ -115,12 +187,13 @@ impl TransferSession {
             return;
         }
         self.stop_and_delete.store(stop_and_delete, Ordering::SeqCst);
+        // Wake any thread blocked on a protocol read (Go's stopBuffer).
+        self._buffer.stop_buffer();
     }
     
     pub fn is_stop_and_delete(&self) -> bool {
         self.stop_and_delete.load(Ordering::SeqCst)
     }
-    
     pub fn get_pause_idx(&self) -> u32 {
         self.pause_idx.load(Ordering::SeqCst)
     }
@@ -440,128 +513,6 @@ impl TransferSession {
         Ok(())
     }
     
-    /// Interactive stop confirmation (Go's confirmStopTransfer).
-    /// Returns Ok(true) if stopped with delete, Ok(false) if stopped without delete,
-    /// Err if continued or on error.
-    pub fn confirm_stop_transfer(&mut self) -> Result<bool> {
-        self.pause_transferring_files();
-
-        // Print newline before prompt
-        self.stdout.write_all(b"\r\n")?;
-        self.stdout.flush()?;
-
-        // Show prompt with cursor highlighting
-        let options = [
-            "Stop and keep transferred files",
-            "Stop and delete transferred files",
-            "Continue to transfer remaining files",
-        ];
-        let mut selected: usize = 0;
-
-        // Render the initial prompt
-        self.render_stop_prompt(&options, selected)?;
-        self.stdout.flush()?;
-
-        // Read user input with arrow key / j/k / tab navigation
-        let mut buf = [0u8; 1];
-        loop {
-            match self.stdin.read_exact(&mut buf) {
-                Ok(()) => match buf[0] {
-                    // Enter
-                    b'\r' | b'\n' => {
-                        self.clear_stop_prompt(&options, selected)?;
-                        self.stdout.flush()?;
-                        break;
-                    }
-                    // Arrow down, j, Tab
-                    b'j' | b'\x1b' => {
-                        if buf[0] == b'\x1b' {
-                            // Read escape sequence: ESC [ A/B
-                            let mut seq = [0u8; 2];
-                            let _ = self.stdin.read_exact(&mut seq);
-                            if seq == *b"[B" || seq == *b"[C" {
-                                selected = (selected + 1) % 3;
-                            } else if seq == *b"[A" || seq == *b"[D" {
-                                selected = (selected + 3 - 1) % 3;
-                            }
-                        } else {
-                            selected = (selected + 1) % 3;
-                        }
-                        // Re-render with cursor position
-                        self.render_stop_prompt(&options, selected)?;
-                        self.stdout.flush()?;
-                    }
-                    // Arrow up, k, Shift+Tab
-                    b'k' => {
-                        selected = (selected + 3 - 1) % 3;
-                        self.render_stop_prompt(&options, selected)?;
-                        self.stdout.flush()?;
-                    }
-                    // Direct number input
-                    b'0' => { selected = 0; break; }
-                    b'1' => { selected = 1; break; }
-                    b'2' => { selected = 2; break; }
-                    // Ctrl+C
-                    b'\x03' => {
-                        self.clear_stop_prompt(&options, selected)?;
-                        self.stdout.flush()?;
-                        self.stop_transferring_files(false);
-                        return Ok(false);
-                    }
-                    _ => {}
-                },
-                Err(_) => {
-                    self.stop_transferring_files(false);
-                    return Ok(false);
-                }
-            }
-        }
-
-        match selected {
-            0 => {
-                self.stop_transferring_files(false);
-                self.stdout.write_all(b"\r\n")?;
-                self.stdout.flush()?;
-                Ok(false)
-            }
-            1 => {
-                self.stop_transferring_files(true);
-                self.stdout.write_all(b"\r\n")?;
-                self.stdout.flush()?;
-                Ok(true)
-            }
-            _ => {
-                self.resume_transferring_files();
-                Ok(false)
-            }
-        }
-    }
-
-    fn render_stop_prompt(&mut self, options: &[&str], selected: usize) -> Result<()> {
-        self.stdout.write_all(b"\x1b[?25l")?;
-        for (i, opt) in options.iter().enumerate() {
-            if i == selected {
-                self.stdout.write_all(format!("\r\x1b[1;32m > {}\x1b[0m\r\n", opt).as_bytes())?;
-            } else {
-                self.stdout.write_all(format!("\r   {}\r\n", opt).as_bytes())?;
-            }
-        }
-        self.stdout.write_all(b"\x1b[?25h")?;
-        self.stdout.write_all(b"\x1b[3A")?;
-        Ok(())
-    }
-
-    fn clear_stop_prompt(&mut self, options: &[&str], _selected: usize) -> Result<()> {
-        for _ in 0..options.len() {
-            self.stdout.write_all(b"\x1b[2K\x1b[1B")?;
-        }
-        self.stdout.write_all(format!("\x1b[{}A", options.len()).as_bytes())?;
-        for _ in 0..options.len() {
-            self.stdout.write_all(b"\x1b[2K\x1b[1B")?;
-        }
-        self.stdout.write_all(b"\x1b[?25h")?;
-        Ok(())
-    }
     
     /// Check if a received line is an error message (#fail:, #FAIL:, #EXIT:)
     /// Returns Ok(Some(error)) if error, Ok(None) if not an error
@@ -1267,12 +1218,11 @@ impl TransferSession {
             let data = &buf[..bytes_read];
             
             let (compressed_data, _was_compressed) = if compress_type != crate::compress::CompressAlgo::None {
-                if self.config.compress == crate::protocol::CompressType::Yes {
-                    // -c yes forces compression (Go isCompressFixed): bypass profitability.
-                    (crate::compress::compress_data(data, compress_type)?, true)
-                } else {
-                    crate::compress::compress_if_profitable(data, compress_type)?
-                }
+                // The negotiated compression mode is the wire contract (Go's
+                // pipelineEncodeData): once compression is on, every chunk is
+                // compressed. Re-deciding profitability per chunk here would
+                // desync the receiver, which trusts the mode/flag.
+                (crate::compress::compress_data(data, compress_type)?, true)
             } else {
                 (data.to_vec(), false)
             };
@@ -1415,12 +1365,11 @@ impl TransferSession {
             let data = &buf[..bytes_read];
             
             let (compressed_data, _was_compressed) = if compress_type != crate::compress::CompressAlgo::None {
-                if self.config.compress == crate::protocol::CompressType::Yes {
-                    // -c yes forces compression (Go isCompressFixed): bypass profitability.
-                    (crate::compress::compress_data(data, compress_type)?, true)
-                } else {
-                    crate::compress::compress_if_profitable(data, compress_type)?
-                }
+                // The negotiated compression mode is the wire contract (Go's
+                // pipelineEncodeData): once compression is on, every chunk is
+                // compressed. Re-deciding profitability per chunk here would
+                // desync the receiver, which trusts the mode/flag.
+                (crate::compress::compress_data(data, compress_type)?, true)
             } else {
                 (data.to_vec(), false)
             };
@@ -2013,4 +1962,64 @@ fn mtime_nanos(metadata: &fs::Metadata) -> Option<i64> {
     metadata.modified().ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_nanos() as i64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// A stdin source that yields EOF immediately so the reader thread exits
+    /// cleanly (the session under test only exercises the stop mechanism).
+    struct EofStdin;
+    impl Read for EofStdin {
+        fn read(&mut self, _b: &mut [u8]) -> std::io::Result<usize> {
+            Ok(0)
+        }
+    }
+
+    /// The wrapper's shared stop handle must stop a running session in place:
+    /// set the session's stopped flag and wake any blocked protocol read
+    /// (regression test for filter.StopTransferringFiles reaching the session).
+    #[test]
+    fn shared_stop_handle_stops_session() {
+        let stop = TransferStop::new();
+        let _session = TransferSession::new_with_stop(
+            crate::protocol::Config::default(),
+            Box::new(EofStdin),
+            Box::new(std::io::sink()),
+            stop.clone(),
+        );
+
+        // Before: not stopped.
+        assert!(!stop.stopped_flag().load(Ordering::SeqCst));
+        assert!(!stop.is_stop_and_delete());
+
+        // Wrapper stops the transfer (keep files) and wakes the shared buffer.
+        stop.stop(false);
+        assert!(stop.stopped_flag().load(Ordering::SeqCst));
+        assert!(!stop.is_stop_and_delete());
+        // A blocked protocol read on the shared buffer now unblocks with an error.
+        assert!(stop
+            .buffer()
+            .read_line(false, Some(Duration::from_secs(1)))
+            .is_err());
+
+        // A second stop() is a no-op (the flag already won the CAS) and must not
+        // clobber the stop-and-delete bit (Go: the first stop wins).
+        stop.stop(true);
+        assert!(
+            !stop.is_stop_and_delete(),
+            "second stop must not overwrite stop_and_delete"
+        );
+    }
+
+    /// stop_and_delete propagates to the shared flag when it is the first stop.
+    #[test]
+    fn shared_stop_handle_delete_flag() {
+        let stop = TransferStop::new();
+        stop.stop(true);
+        assert!(stop.is_stop_and_delete());
+        assert!(stop.stopped_flag().load(Ordering::SeqCst));
+    }
 }

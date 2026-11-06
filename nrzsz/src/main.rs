@@ -153,16 +153,45 @@ fn main() -> Result<()> {
     // Spawn two threads: stdin→child stdin (wrapInput), child stdout→terminal (wrapOutput)
     let child_stdout = child.stdout.take().unwrap();
 
-    // Handle SIGINT (Ctrl+C) → stop transferring files
-    // Handle SIGTERM → terminate child
+    // Handle SIGINT (Ctrl+C) → stop the active transfer but keep the session
+    // running (Go's handleSignal: filter.StopTransferringFiles(false)). Handle
+    // SIGTERM → terminate the child and shut the wrapper down.
     let stopped_sig = stopped.clone();
     let child_id = child.id();
-    ctrlc::set_handler(move || {
-        stopped_sig.store(true, Ordering::SeqCst);
-        unsafe {
-            libc::kill(child_id as i32, libc::SIGTERM);
-        }
-    }).ok();
+    #[cfg(unix)]
+    {
+        use signal_hook::iterator::Signals;
+        use signal_hook::consts::signal::{SIGINT, SIGTERM};
+        let filter_sig = filter.clone();
+        let mut signals = Signals::new([SIGINT, SIGTERM]).map_err(|e| anyhow::anyhow!("{}", e))?;
+        std::thread::spawn(move || {
+            for sig in signals.forever() {
+                match sig {
+                    SIGINT => {
+                        let f = filter_sig.lock().unwrap();
+                        f.stop_transferring(false);
+                    }
+                    SIGTERM => {
+                        stopped_sig.store(true, Ordering::SeqCst);
+                        unsafe {
+                            libc::kill(child_id as i32, libc::SIGTERM);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        });
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = &child_id;
+        ctrlc::set_handler(move || {
+            stopped_sig.store(true, Ordering::SeqCst);
+            unsafe {
+                libc::kill(child_id as i32, libc::SIGTERM);
+            }
+        }).ok();
+    }
 
     // Thread 1: wrapInput — reads real stdin, forwards to child stdin
     let input_stopped = stopped.clone();

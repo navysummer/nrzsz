@@ -259,14 +259,14 @@ async fn main() -> Result<()> {
         Box::new(stdout_pipe),
     );
     
-    // Set up signal handling
+    // Set up signal handling (matching Go's handleServerSignal: stop, keep files)
     let stopped = Arc::new(AtomicBool::new(false));
     let stopped_clone = stopped.clone();
-    let created_files_shared = Arc::new(std::sync::Mutex::new(Vec::<std::path::PathBuf>::new()));
-    let created_files_for_signal = created_files_shared.clone();
     
     tokio::spawn(async move {
-        // Handle SIGINT (Ctrl+C) and SIGTERM (kill), matching Go's handleServerSignal
+        // Handle SIGINT (Ctrl+C) and SIGTERM, matching Go's handleServerSignal:
+        // stop the transfer but keep files already received (no interactive delete
+        // prompt — that path blocks the async runtime and diverges from Go).
         #[cfg(unix)]
         {
             use tokio::signal::unix::{signal, SignalKind};
@@ -282,31 +282,7 @@ async fn main() -> Result<()> {
             signal::ctrl_c().await.ok();
         }
         
-        // Show stop confirmation dialog
-        #[cfg(unix)]
-        {
-            use std::io::{self, Write};
-            eprint!("\nDo you want to stop and delete the received files? (y/N): ");
-            io::stderr().flush().ok();
-            
-            let mut input = String::new();
-            if io::stdin().read_line(&mut input).is_ok() {
-                let input = input.trim().to_lowercase();
-                if input == "y" || input == "yes" {
-                    // Delete created files
-                    if let Ok(files) = created_files_for_signal.lock() {
-                        for file in files.iter().rev() {
-                            if file.is_dir() {
-                                let _ = std::fs::remove_dir_all(file);
-                            } else {
-                                let _ = std::fs::remove_file(file);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        
+        // Stop the transfer; received files are kept on disk.
         stopped_clone.store(true, Ordering::SeqCst);
         nrzsz_core::transfer::set_stopped(true);
     });
@@ -335,12 +311,6 @@ async fn main() -> Result<()> {
     // Receive files
     let local_list = session.recv_files(&dest_path, args.quiet)?;
     
-    // Sync created files for signal handler cleanup
-    {
-        if let Ok(mut files) = created_files_shared.lock() {
-            files.extend(session.get_created_files().iter().cloned());
-        }
-    }
     
     // Print results
     for file_name in &local_list {

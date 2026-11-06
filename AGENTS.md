@@ -131,18 +131,20 @@ deleted the `TunnelConnection`/`TunnelManager` class API), `terminal.rs`
 (kept `get_terminal_columns`; deleted `TerminalWrapper`/`TerminalInfo`/
 `setup_server_env`/`detect_client_support`/`get_client_cwd`).
 
-**Retained as library surface:** `api.rs` (`NrzszOptions`/handlers,
-re-exported in `lib.rs`) is the embedding API. Its free functions
-(`upload_files`/`download_files`/`start_relay`) duplicate the tunnel handshake
-already implemented in `filter.rs::run_transfer` and are not used by any
-binary; they may be removed later, but they are the intended public surface.
-
+**Retained as library surface:** `api.rs` (`NrzszOptions::to_config`,
+`TransferStateHandler`, re-exported in `lib.rs`) is the embedding API — options
+plus a transfer-state callback. There are no free `upload_files`/
+`download_files`/`start_relay` functions in `api.rs`; the actual transfer path
+is `filter.rs::run_transfer` (trigger → tunnel → `TransferSession`), and the
+dead `NrzszFilter::upload_files`/`download_files` stubs were removed this
+session (§4.6).
 ### Explicit stubs (no-op) — retained
 
 | Location | Symbol | Status |
 |---|---|---|
-| `filter.rs` | `NrzszFilter::upload_files` / `download_files` | Stub — only `eprintln!("Uploading/Downloading: …")`; real work via `one_time_upload`/trigger path |
 | `zmodem.rs` | `ZmodemProxy::proxy_zmodem_send` / `proxy_zmodem_receive` | Stub — return `Ok(())`; retained for API compat; `detect_zmodem_sequence`/`send_zmodem_start`/`send_zmodem_cancel` are real |
+
+
 
 ---
 
@@ -154,7 +156,7 @@ binary; they may be removed later, but they are the intended public surface.
 | **Fork with tunnel** | ✅ fixed | `send_action` now advertises `tunnel: Some(tunnel_connected)`, so `use_tunnel` is true over the tunnel and fork actually gates (§4.5) |
 | **`-p`/`-w`/`-+` (protect/windowsize/append)** | ✅ implemented | `Config` fields `protect`/`window_size`/`append` wired; protect-skip, window size, append all verified end-to-end (§4.4) |
 | **Relay + `-o`/`-u`/`-D`** | Not supported | Relay only bridges; these flags are filter-mode-only (matches Go — relay only does tracelog) |
-| **`api.rs` free functions** | Dead surface | `upload_files`/`download_files`/`start_relay` duplicate `filter.rs::run_transfer`; unused by any binary — candidate for removal |
+| **`api.rs` surface** | ✅ done (§4.9) | rebuilt as a real embedding surface: `NrzszOptions::build_filter` (→ Config + setters), `TransferStateHandler` (bool start/stop callback) → `apply_to(filter)`; Go's `TransferState` enum removed |
 | **`-Y` vs lrzsz semantics** | Divergence | nrzsz `-Y` = "overwrite if source newer"; lrzsz `-Y` = "clobber + skip-if-not-found" (`ZF1_ZMSKNOLOC`). Deliberate; nrzsz targets Go, which has no `-Y`. |
 | **V4 directory archive** | Not implemented | Go groups a directory's files into one streamed `SubFiles` archive entry; nrzsz sends each file individually (correct, only a wire-size optimization) |
 | **Non-tunnel fallback** | Design choice | nrzsz always transfers over the TCP tunnel; Go can fall back to raw terminal streams when no connector is set |
@@ -274,6 +276,153 @@ Found via a fresh source-level comparison against `/tmp/trzsz-go/trzsz` and
 8/8 feature smoke (text, 3 MB binary, directory, fork, `-c yes` compress,
 resume, `-Y`, `-+`). The 2 zmodem smoke tests pass with `--ignored`.
 
+### 4.6 Stop / transfer-control plumbing (fresh trzsz-go comparison, this session)
+
+A fresh source-level comparison against `/tmp/trzsz-go/trzsz` found the
+stop / during-transfer control path diverged from Go and was partially dead.
+All fixed and verified:
+
+1. **`nrz` SIGINT deleted received files** — the server's signal handler had
+   an interactive "stop and delete?" prompt that also blocked the async
+   runtime. Go's `trz` `handleServerSignal` only calls
+   `stopTransferringFiles(false)` (keep files, no prompt). Removed the prompt
+   and the file-deletion path; SIGINT/SIGTERM now stop-and-keep
+   (`nrz/src/main.rs`).
+2. **Wrapper stop never reached the running session** —
+   `NrzszFilter::stop_transferring_files` only set a filter-level flag; the
+   `TransferSession` on the spawned thread kept going. Added a shared
+   `TransferStop` handle (`transfer.rs`): `TransferSession::new_with_stop`
+   sources its `stopped`/`stop_and_delete` flags and `NrzszBuffer` from the
+   handle; `run_transfer` registers a fresh handle per transfer in an
+   `active_stop` slot; `stop_transferring(stop_and_delete)` stops the live
+   session and wakes a blocked protocol read (Go's `StopTransferringFiles`
+   → `stopTransferringFiles` → `stopBuffer`).
+3. **`nrzsz` SIGINT/SIGTERM split** — the wrapper used one `ctrlc` handler
+   that killed the child on either signal. Go's `handleSignal` keeps the
+   child on SIGINT (stop transfer only) and terminates on SIGTERM. Split via
+   `signal_hook::iterator::Signals`: SIGINT → `stop_transferring(false)`,
+   SIGTERM → stop + `SIGTERM` to child (`nrzsz/src/main.rs`).
+4. **`one_time_upload` result never resolved** — the receiver had no resolver
+   and no timeout; `set_one_time_upload_result` was dead. Now `one_time_upload`
+   arms a 10s watchdog (Go's `OneTimeUpload` "upload did not start" timer) and
+   `run_transfer` resolves the channel after an R/D/F upload (Go's
+   `setOneTimeUploadResult`). The one-time files slot is shared with the
+   transfer thread, and `upload_files_to` consumes it first (Go's
+   `chooseUploadPaths` returns `oneTimeUploadFiles` before `-u`).
+5. **Ctrl+C during a transfer was forwarded to the remote** — Go's
+   `handleClientInput` routes a local `0x03` to `handleInputCtrlC` (stop the
+   local transfer) instead of sending it to the server. `process_input` now
+   stops the active session on a raw `0x03` (dropped from the forwarded
+   bytes) or a decoded tmux-CC `send -t %N 0x3` (consumed, not forwarded).
+6. **Dead stubs deleted** — `NrzszFilter::upload_files` / `download_files`
+   (eprintln no-ops, unused by any binary) removed (§2).
+
+**Verification:** `cargo build --release --workspace` = 0 warnings;
+`cargo test --release --workspace` = 68 lib + 13 protocol, 0 failed;
+2 zmodem e2e pass with `--ignored`. New regression tests:
+`shared_stop_handle_stops_session` / `shared_stop_handle_delete_flag`
+(`transfer.rs`), `test_one_time_upload_slot_plumbing` /
+`test_process_input_ctrl_c_during_transfer_stops` (`filter.rs`). End-to-end:
+a 400 MB upload stopped by SIGINT mid-data-transfer leaves a partial file
+(no growth after the signal) with the wrapper still alive; directory + `-Y`
+conflict semantics re-verified byte-identical.
+
+### 4.7 Download-direction e2e harness + compress-contract bug (this session)
+
+Built the missing **download-direction e2e harness** (the §7 gap): a real
+`nsz` server process over the TCP tunnel, driven by a client that mirrors
+`filter.rs::download_files_from` (handshake → `send_action` → `recv_config`
+→ `recv_files` → `client_exit`). Location: `nsz/tests/tunnel_download_e2e.rs`
+(3 tests: 3 MB binary file, recursive directory via `nsz -d`, plus a
+`check_paths_readable` sanity — all byte-identical; `nsz/Cargo.toml` gained
+`[dev-dependencies] tempfile`).
+
+Found and fixed a real wire-contract bug the harness exposed (directory
+downloads failed with zstd "Unknown frame descriptor"):
+
+- **`transfer.rs::send_file_data_with_compress` / `send_file_data` re-decided
+  per-chunk compression profitability AFTER the COMP flag was already sent.**
+  In Auto mode, `is_compress_fixed` fixes `compress=true` for sizes
+  512 B–128 KB without content sampling; both sides then skip the COMP frame
+  and the receiver assumes zstd — but the sender's `compress_if_profitable`
+  still sent an incompressible chunk raw → receiver decompressed garbage.
+  Go's `pipelineEncodeData` compresses **every** chunk once the flag/mode is
+  set. Fixed: once `compress_type != None`, every chunk is compressed
+  unconditionally (both call sites, so V1 and V2/V3 paths behave the same).
+
+Verification: `cargo test --workspace` = 68 lib + 13 protocol + 3 e2e,
+0 failed; 2 zmodem smoke pass with `--ignored`; `cargo build --release
+--workspace` clean (0 warnings). Downloads verified byte-identical for both a
+file and a directory (client's saved-name list matches Go's `recvFiles`
+semantics: deduped `RelPath[0]`, i.e. only the dir root).
+
+### 4.9 Embedding API (`api.rs`) rebuilt (this session)
+
+`api.rs` was entirely dead surface: `NrzszOptions::to_config` was kept for the
+`Default` impl but no binary or caller used any of it; `TransferState` was a
+parallel enum matching nothing; `TransferStateHandler` was re-exported but
+never wired to a `NrzszFilter`. Rebuilt to match Go's embedding surface:
+
+- **`NrzszOptions::build_filter(self) -> NrzszFilter`** — builds `Config` via
+  `to_config` and wires the setters that `NrzszOptions` actually controls
+  (`dragfile` → `set_enable_dragfile`, `zmodem` → `set_enable_zmodem`,
+  `osc52` → `set_enable_osc52`). Documented that connector / paths / uploaded
+  files stay caller-side setters.
+- **`TransferStateHandler`** — Go's `SetTransferStateCallback(bool)` idiom: a
+  `bool` start/stop callback (true at transfer start, false at end), with
+  **`apply_to(&mut NrzszFilter)`** bridging into `set_transfer_state_callback`.
+  `apply_to` sends the callback through; the previous `TransferState` enum is
+  removed (it matched nothing in Go or in `filter.rs`).
+- `NrzszOptions::to_config` is kept (used by callers who want just the
+  `Config`); `parse_size` also gained `kib/mib/gib` units.
+- The `TransferState` export in `lib.rs` was replaced with
+  `TransferStateCallback`.
+
+Verification: `cargo test --workspace` = 70 lib (+2 new: `test_build_filter_wires_setters`,
+`test_transfer_state_handler_applies_to_filter`; the latter feeds a trigger
+line through a real `NrzszFilter` and asserts the bool callback fires with
+`true`), 13 protocol, 3 tunnel e2e, 1 relay download, 1 relay upload —
+0 failed; `cargo build --release --workspace` clean.
+
+### 4.8 Filter+relay integration harness + relay tunnel-hello desync (this session)
+
+Built the **filter+relay integration harness** (the §7 integration-test gap):
+an end-to-end test with a real `nsz`/`nrz` server process sitting behind
+`NrzszRelay`, acting as the relay that **rewrites the trigger's tunnel port
+and bridges the previous-hop TCP connection to the server tunnel**. The
+previous hop runs a real `NrzszFilter` (same code path `nrzsz` uses for a
+trigger) whose `tunnel_connector` connects to the relay's rewritten port.
+
+- `nsz/tests/filter_relay_download_e2e.rs` — `nsz` behind relay → filter
+  pulls the rewritten `S` trigger → downloads byte-identical. 2 MB binary
+  file.
+- `nrz/tests/filter_relay_upload_e2e.rs` — `nrz` behind relay → filter
+  pushes `-u`-style files → byte-identical at the server's dest.
+- `nsz/tests/tunnel_download_e2e.rs` — direct tunnel download harness (§4.7).
+- The harness found and fixed a **race in `relay_tunnel`'s hello reads**:
+  both the client hello and the server hello were read with a fixed 100-byte
+  `read()`; when the peer's terminator `\n` arrived in a separate TCP
+  segment, the newline was left in the relay's stream **and the server's
+  stream** (hello passed to nsz consumed less than a line for the following
+  protocol frame), so nsz saw a bare empty line and died with
+  `Error: Invalid format:` (~7/8 runs failed). Fixed: both hellos are read
+  line-at-a-time via `tunnel::read_line_from_stream` (same class of bug as
+  §4.5 item 6). Test passes 8/8 consecutively after the fix.
+- Also fixed the same fixed-buffer read in `filter.rs::connect_to_tunnel`
+  (dead-ish API path, same trap).
+- **Bounded the relay STANDBY detect buffer** to 4 KiB (`detect_buf` was
+  unbounded, so throughput/trigger scans were O(n²) and the buffer grew
+  forever on a silent session).
+
+Verification: `cargo test --workspace` = 68 lib + 13 protocol + 3 tunnel e2e +
+1 relay download + 1 relay upload, 0 failed
+(plus 2 zmodem smoke `--ignored`); `cargo build --release --workspace` clean
+(0 warnings). Relay-related diagram is unchanged (raw `#ACT` relay path kept
+as designed; the harness exercises the rewritten-port TCP-bridge path, which
+is what a rewritten trigger actually drives — the raw path remains available
+for previous-hop filters that run transfer over raw streams).
+
+
 ---
 
 ## 5. Gap analysis vs trzsz-go v1.2.0
@@ -287,10 +436,14 @@ Remaining differences vs trzsz-go:
 | iTerm2 drag `%begin`/`%end` | ✅ now wired | `upload_drag_files` (Go `uploadDragFiles` parity); **tmux-CC command now hex-encoded + `send -t`-wrapped (§4.5)** |
 | `~/.trzsz.conf` (Go keys) | ✅ now read | `config.rs::load_trzsz_conf` + `filter.rs::read_config` |
 | `ProgressColorPair` gradient | ✅ now reaches progress bar | `BlendLuv` matches go-colorful byte-for-byte; `set_progress_color_pair` now populates the transfer `Config` (§4.5) |
-| Go embedding setters | ⚠️ on `NrzszFilter` | all 14 setters exist on `NrzszFilter` (`filter.rs`); `api.rs` exposes only a parallel `NrzszOptions` surface |
+| Go embedding setters | ✅ done (§4.9) | `api.rs` is now a real embedding surface: `NrzszOptions::build_filter` builds a filter wired via the `dragfile`/`zmodem`/`osc52` setters; `TransferStateHandler` hands a `bool` callback (Go's `SetTransferStateCallback(start/stop)`) into the filter via `apply_to`; `NrzszOptions` docs what remains caller-side (connector/paths) |
 | zmodem auto-rename `-E` | ⚠️ partial | `ZmodemProxy` stubs retained; auto-rename via `resolve_dest` exists |
 | Windows ConPTY | ⚠️ build fixed, runtime untested | `windows_flush` migrated; no Windows host to execute |
 | Warp terminal drag prefixes | ✅ handled | `detect_drag_files` handles old/new warp prefixes + bracketed paste |
+| `StopTransferringFiles(stopAndDelete)` reaches live session | ✅ now wired | shared `TransferStop` handle; wrapper/SIGINT/tmux-CC stop the running transfer in place (§4.6) |
+| Wrapper SIGINT vs SIGTERM split | ✅ now split | SIGINT keeps the child + stops the transfer; SIGTERM terminates (§4.6) |
+| `OneTimeUpload` result + 10s watchdog | ✅ now resolved | `run_transfer` resolves the channel; 10s timer reports "did not start" (§4.6) |
+| Ctrl+C during transfer stops locally | ✅ now handled | `process_input` stops the active session instead of forwarding `0x03` to the remote (§4.6) |
 
 **What nrzsz has that trzsz-go also has (matched):** V1–V4 negotiation,
 zstd+zlib compression, V3 prefix-hash resume, directory transfer, fork,
@@ -342,15 +495,10 @@ nrzsz's directory support is a *superset* of lrzsz.
 
 1. **Windows runtime test** — run `pty/windows.rs` (ConPTY) and `binary=false`
    on a real Windows host.
-2. **Wire `api.rs` free functions to `NrzszFilter` setters** (all 14 Go setters
-   exist on `NrzszFilter`) or remove the unused free functions.
-3. **Add an integration-test harness** for filter+relay so smoke tests are
-   reproducible, not manual.
-4. **Fork-with-tunnel gating** — only advertise `SupportFork` once the tunnel
-   is connected (matches Go).
-5. **Download-direction end-to-end harness** — the upload direction is fully
-   smoke-tested (`nrzsz -u`); add a symmetric download smoke test that drives
-   `nrzsz -D` + a real `nsz` sender over the tunnel.
+2. ~~**Wire `api.rs` free functions to `NrzszFilter` setters**~~ ✅ done (§4.9).
+3. ~~**Add an integration-test harness** for filter+relay~~ ✅ done (§4.8).
+4. ~~Fork-with-tunnel gating~~ ✅ done (§4.5 item 1).
+5. ~~Download-direction end-to-end harness~~ ✅ done (§4.7).
 
 ---
 
@@ -376,9 +524,20 @@ nrzsz's directory support is a *superset* of lrzsz.
 
 ## 9. Test / verification status
 
-- `cargo test --workspace`: **64 lib + 13 protocol, 0 failed** (plus 2 zmodem
-  smoke `--ignored`). New regression tests `test_tunnel_hello_read_does_not_overread`,
-  `test_send_action_advertises_tunnel`, `test_send_action_no_tunnel_advertises_false`.
+- `cargo test --workspace`: **70 lib + 13 protocol + 3 tunnel e2e + 1 relay
+  download + 1 relay upload, 0 failed** (plus 2 zmodem smoke `--ignored`).
+  New: `nsz/tests/tunnel_download_e2e.rs` — download direction over a real
+  `nsz` server + TCP tunnel (file + directory, byte-identical), and the
+  compress-contract regression it caught (§4.7); `nsz/tests/
+  filter_relay_download_e2e.rs` and `nrz/tests/filter_relay_upload_e2e.rs` —
+  filter+relay full stack over a real server behind `NrzszRelay`
+  (§4.8, plus the relay hello-desync fix).
+  Prior regression tests: `shared_stop_handle_stops_session`,
+  `shared_stop_handle_delete_flag`, `test_one_time_upload_slot_plumbing`,
+  `test_process_input_ctrl_c_during_transfer_stops` (this session, §4.6);
+  `test_tunnel_hello_read_does_not_overread`,
+  `test_send_action_advertises_tunnel`, `test_send_action_no_tunnel_advertises_false`
+  (prior sessions).
 - **Comprehensive smoke (this session, 8/8):** upload text, 3 MB binary,
   directory recursive, fork `-f`, `-c yes` compress, `--resume`, `-Y`, `-+`
   — all byte-identical over the TCP tunnel.

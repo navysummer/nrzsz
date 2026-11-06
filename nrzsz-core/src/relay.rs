@@ -8,7 +8,7 @@ use log::debug;
 
 use crate::buffer::NrzszBuffer;
 use crate::filter::parse_trigger;
-use crate::tunnel::get_hello_constant;
+use crate::tunnel::{get_hello_constant, read_line_from_stream};
 
 const RELAY_STANDBY: i32 = 0;
 const RELAY_HANDSHAKING: i32 = 1;
@@ -172,6 +172,15 @@ impl NrzszRelay {
 
                         if status == RELAY_STANDBY {
                             detect_buf.extend_from_slice(data);
+                            // Keep only the trailing window: the trigger line is
+                            // ~60 bytes, so 4 KiB is plenty and prevents the
+                            // detect buffer (and the rfind scan) from growing
+                            // without bound on a silent session.
+                            const DETECT_KEEP: usize = 4096;
+                            if detect_buf.len() > DETECT_KEEP {
+                                let drain = detect_buf.len() - DETECT_KEEP;
+                                detect_buf.drain(..drain);
+                            }
                             if let Some(trigger) = detect_trigger_in_buffer(&detect_buf) {
                                 debug!("Relay detected trigger: {:?}", trigger);
                                 relay_status.store(RELAY_HANDSHAKING, Ordering::SeqCst);
@@ -415,18 +424,19 @@ fn relay_tunnel(
     connector: Box<TunnelConnector>,
 ) {
     if let Ok((mut client_conn, _)) = listener.accept() {
-            // Client sends its hello (using relay port)
+            // Client sends its hello (using relay port). Read it line-at-a-time:
+            // a fixed-size read can miss the trailing `\n`, leaving a stray
+            // newline in the stream that desyncs the next protocol frame.
             let relay_port = listener.local_addr().unwrap().port();
             let (client_hello_relay, server_hello_relay) = get_hello_constant(&uid, relay_port);
             let (client_hello_target, server_hello_target) = get_hello_constant(&uid, target_port);
 
-            let mut buf = [0u8; 100];
-            let n = match client_conn.read(&mut buf) {
-                Ok(n) => n,
+            let received = match read_line_from_stream(&mut client_conn) {
+                Ok(line) => line.trim().to_string(),
                 Err(_) => return,
             };
-            let received = String::from_utf8_lossy(&buf[..n]).trim().to_string();
             if received != client_hello_relay {
+                debug!("Relay: client hello mismatch: {:?} != {:?}", received, client_hello_relay);
                 return;
             }
 
@@ -440,12 +450,12 @@ fn relay_tunnel(
             server_conn.write_all(b"\n").ok();
             server_conn.flush().ok();
 
-            let n = match server_conn.read(&mut buf) {
-                Ok(n) => n,
+            let response = match read_line_from_stream(&mut server_conn) {
+                Ok(line) => line.trim().to_string(),
                 Err(_) => return,
             };
-            let response = String::from_utf8_lossy(&buf[..n]).trim().to_string();
             if response != server_hello_target {
+                debug!("Relay: server hello mismatch: {:?} != {:?}", response, server_hello_target);
                 return;
             }
 
@@ -463,6 +473,8 @@ fn relay_tunnel(
                 Err(_) => return,
             };
 
+            debug!("Relay: tunnel bridge established, starting bidirectional pump");
+
             let (tx1, rx1) = mpsc::channel::<Vec<u8>>();
             let (tx2, rx2) = mpsc::channel::<Vec<u8>>();
 
@@ -473,6 +485,7 @@ fn relay_tunnel(
                     match server_out.read(&mut buf) {
                         Ok(0) => break,
                         Ok(n) => {
+                            debug!("Relay: pump server->client {} bytes: {:?}", n, String::from_utf8_lossy(&buf[..n]).chars().take(120).collect::<String>());
                             if tx2.send(buf[..n].to_vec()).is_err() {
                                 break;
                             }
@@ -506,6 +519,7 @@ fn relay_tunnel(
                 match client_conn.read(&mut buf) {
                     Ok(0) => break,
                     Ok(n) => {
+                        debug!("Relay: pump client->server {} bytes: {:?}", n, String::from_utf8_lossy(&buf[..n]).chars().take(120).collect::<String>());
                         if tx1.send(buf[..n].to_vec()).is_err() {
                             break;
                         }
@@ -513,7 +527,7 @@ fn relay_tunnel(
                     Err(_) => break,
                 }
             }
-        }
+    }
 }
 
 /// Helper for setting up a relay between two streams.

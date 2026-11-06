@@ -1,4 +1,4 @@
-use std::io::{Read, Write};
+use std::io::Write;
 use std::net::TcpStream;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -309,8 +309,8 @@ pub struct NrzszFilter {
     default_upload_path: String,
     drag_file_upload_command: String,
     upload_command_is_not_trz: bool,
-    one_time_upload_files: Vec<String>,
-    one_time_upload_result: Option<std::sync::mpsc::Sender<Result<()>>>,
+    one_time_upload_files: Arc<std::sync::Mutex<Vec<String>>>,
+    one_time_upload_result: Arc<std::sync::Mutex<Option<std::sync::mpsc::Sender<Result<()>>>>>,
     skip_upload_command: Arc<AtomicBool>,
     current_upload_command: Arc<std::sync::Mutex<String>>,
     interrupting: Arc<AtomicBool>,
@@ -318,6 +318,7 @@ pub struct NrzszFilter {
     zmodem_auto_rename: bool,
     client_out: Arc<Mutex<Box<dyn std::io::Write + Send>>>,
     server_in: Arc<Mutex<Box<dyn std::io::Write + Send>>>,
+    active_stop: Arc<std::sync::Mutex<Option<Arc<crate::transfer::TransferStop>>>>,
 }
 
 impl NrzszFilter {
@@ -344,8 +345,8 @@ impl NrzszFilter {
             default_upload_path: String::new(),
             drag_file_upload_command: String::new(),
             upload_command_is_not_trz: false,
-            one_time_upload_files: Vec::new(),
-            one_time_upload_result: None,
+            one_time_upload_files: Arc::new(std::sync::Mutex::new(Vec::new())),
+            one_time_upload_result: Arc::new(std::sync::Mutex::new(None)),
             skip_upload_command: Arc::new(AtomicBool::new(false)),
             current_upload_command: Arc::new(std::sync::Mutex::new(String::new())),
             interrupting: Arc::new(AtomicBool::new(false)),
@@ -353,6 +354,7 @@ impl NrzszFilter {
             zmodem_auto_rename: false,
             client_out: Arc::new(Mutex::new(Box::new(std::io::sink()))),
             server_in: Arc::new(Mutex::new(Box::new(std::io::sink()))),
+            active_stop: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -369,6 +371,13 @@ impl NrzszFilter {
     }
 
     
+    #[cfg(test)]
+    pub(crate) fn osc52_enabled(&self) -> bool { self.enable_osc52 }
+    #[cfg(test)]
+    pub(crate) fn zmodem_enabled(&self) -> bool { self.enable_zmodem }
+    #[cfg(test)]
+    pub(crate) fn dragfile_enabled(&self) -> bool { self.enable_dragfile }
+
     pub fn set_enable_osc52(&mut self, enable: bool) {
         self.enable_osc52 = enable;
         if enable {
@@ -468,14 +477,31 @@ impl NrzszFilter {
 
     pub fn one_time_upload(&mut self, files: Vec<String>) -> std::sync::mpsc::Receiver<Result<()>> {
         let (tx, rx) = std::sync::mpsc::channel();
-        self.one_time_upload_files = files;
-        self.one_time_upload_result = Some(tx);
+        *self.one_time_upload_files.lock().unwrap() = files;
+        *self.one_time_upload_result.lock().unwrap() = Some(tx);
+        // Go's OneTimeUpload: a 10s watchdog that reports "the upload did not
+        // start" if the result channel is still pending (trzsz not installed /
+        // no trigger seen).
+        let result_slot = self.one_time_upload_result.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(10));
+            let tx = {
+                let mut guard = result_slot.lock().unwrap();
+                guard.take()
+            };
+            if let Some(tx) = tx {
+                let _ = tx.send(Err(anyhow!(
+                    "the upload did not start, possibly because trzsz is not installed or trz is not found on the server"
+                )));
+            }
+        });
         rx
     }
 
-    #[allow(dead_code)]
-    fn set_one_time_upload_result(&mut self, result: Result<()>) {
-        if let Some(tx) = self.one_time_upload_result.take() {
+    /// Resolve the pending one-time upload result, if any. Called by the transfer
+    /// thread once an R/D/F upload completes (Go's `setOneTimeUploadResult`).
+    pub fn set_one_time_upload_result(&self, result: Result<()>) {
+        if let Some(tx) = self.one_time_upload_result.lock().unwrap().take() {
             let _ = tx.send(result);
         }
     }
@@ -588,9 +614,9 @@ impl NrzszFilter {
         stream.write_all(b"\n")?;
         stream.flush()?;
         
-        let mut buf = [0u8; 100];
-        let n = stream.read(&mut buf)?;
-        let response = String::from_utf8_lossy(&buf[..n]).trim().to_string();
+        // Verify the server hello line-at-a-time (a fixed-size read can leave
+        // a stray newline that desyncs the next protocol frame).
+        let response = crate::tunnel::read_line_from_stream(&mut stream)?.trim().to_string();
         if response != server_hello {
             return Err(anyhow!("Tunnel: unexpected server hello: {:?}", response));
         }
@@ -633,7 +659,7 @@ impl NrzszFilter {
                 let state = zmodem.state.clone();
                 let choose_upload = {
                     let upload_files = self.upload_files.clone();
-                    let one_time = self.one_time_upload_files.clone();
+                    let one_time = self.one_time_upload_files.lock().unwrap().clone();
                     let default_upload = self.default_upload_path.clone();
                     let drag_cmd = self.drag_file_upload_command.clone();
                     let allowed = self.allowed_auto_upload_dirs.clone();
@@ -733,25 +759,25 @@ impl NrzszFilter {
             default_download_path: self.default_download_path.clone(),
             upload_files: self.upload_files.clone(),
             allowed_auto_upload_dirs: self.allowed_auto_upload_dirs.clone(),
+            active_stop: self.active_stop.clone(),
+            one_time_files: self.one_time_upload_files.clone(),
+            one_time_result: self.one_time_upload_result.clone(),
         }
     }
     
-    pub fn upload_files(&self, files: &[String]) -> Result<()> {
-        for file in files {
-            eprintln!("Uploading: {}", file);
-        }
-        Ok(())
-    }
-    
-    pub fn download_files(&self, files: &[String]) -> Result<()> {
-        for file in files {
-            eprintln!("Downloading: {}", file);
-        }
-        Ok(())
-    }
-    
+    /// Stop the in-flight transfer (keep already-received files). No-op if no
+    /// transfer is running. Matches Go's `filter.StopTransferringFiles(false)`.
     pub fn stop_transferring_files(&self) {
-        self.stopped.store(true, Ordering::SeqCst);
+        self.stop_transferring(false);
+    }
+
+    /// Stop the in-flight transfer, optionally deleting files created so far.
+    /// No-op if no transfer is running. The wrapper itself keeps running (Go's
+    /// `filter.StopTransferringFiles` stops only the active transfer).
+    pub fn stop_transferring(&self, stop_and_delete: bool) {
+        if let Some(handle) = self.active_stop.lock().unwrap().clone() {
+            handle.stop(stop_and_delete);
+        }
     }
 
     /// Process client input (stdin). Detects drag files, skipUploadCommand, and interrupting.
@@ -770,7 +796,29 @@ impl NrzszFilter {
         }
 
         if self.is_transferring.load(Ordering::SeqCst) {
-            // Transfer in progress, forward all input
+            // A local Ctrl+C stops the transfer in place instead of being
+            // forwarded to the remote (Go's handleClientInput -> handleInputCtrlC).
+            // Raw (non-tmux) mode: a bare 0x03 byte. Tmux `-CC` control mode:
+            // a `send -t %N 0x3` control command that must be decoded first.
+            let raw_ctrl = buf.contains(&0x03);
+            let tmux_cc_ctrl = !raw_ctrl
+                && buf.first() == Some(&b's')
+                && {
+                    let (decoded, _) = crate::tmuxcc::decode_tmux_input(buf);
+                    decoded.iter().any(|&b| b == 0x03)
+                };
+            if raw_ctrl || tmux_cc_ctrl {
+                self.stop_transferring(false);
+            }
+            // Raw: drop the Ctrl+C byte, forward the rest. Tmux-CC: the
+            // `send 0x3` command is a local stop, so it is consumed, not
+            // forwarded to the server.
+            if tmux_cc_ctrl {
+                return Vec::new();
+            }
+            if raw_ctrl {
+                return buf.iter().filter(|&&b| b != 0x03).copied().collect::<Vec<u8>>();
+            }
             return buf.to_vec();
         }
 
@@ -856,8 +904,8 @@ impl NrzszFilter {
     /// Choose upload file paths using zenity file dialog.
     /// Returns None if user cancels or zenity is unavailable.
     pub fn choose_upload_paths(&self, directory: bool) -> Option<Vec<String>> {
-        if !self.one_time_upload_files.is_empty() {
-            return Some(self.one_time_upload_files.clone());
+        if !self.one_time_upload_files.lock().unwrap().is_empty() {
+            return Some(self.one_time_upload_files.lock().unwrap().clone());
         }
         if !self.upload_files.is_empty() {
             return Some(self.upload_files.clone());
@@ -899,6 +947,9 @@ struct TransferCtx {
     default_download_path: String,
     upload_files: Vec<String>,
     allowed_auto_upload_dirs: Vec<String>,
+    active_stop: Arc<std::sync::Mutex<Option<Arc<crate::transfer::TransferStop>>>>,
+    one_time_files: Arc<std::sync::Mutex<Vec<String>>>,
+    one_time_result: Arc<std::sync::Mutex<Option<std::sync::mpsc::Sender<Result<()>>>>>,
 }
 
 impl TransferCtx {
@@ -943,8 +994,16 @@ impl TransferCtx {
         
         let stdin_pipe = Box::new(stream.try_clone()?);
         let stdout_pipe = Box::new(stream);
-        let mut session = TransferSession::new(self.config.clone(), stdin_pipe, stdout_pipe);
+        // Register a fresh stop handle so the wrapper (SIGINT / tmux-CC Ctrl+C) can
+        // stop this session in place (Go's filter.StopTransferringFiles -> stopTransferringFiles).
+        let stop = crate::transfer::TransferStop::new();
+        *self.active_stop.lock().unwrap() = Some(stop.clone());
+        let mut session = TransferSession::new_with_stop(self.config.clone(), stdin_pipe, stdout_pipe, stop);
         
+        let is_upload = match trigger.mode {
+            'R' | 'D' | 'F' => true,
+            _ => false,
+        };
         let result = match trigger.mode {
             'S' => self.download_files_from(&mut session, trigger),
             'R' | 'D' | 'F' => self.upload_files_to(&mut session, trigger),
@@ -953,8 +1012,18 @@ impl TransferCtx {
                 Ok(())
             }
         };
-        
-        let _ = result;
+
+        // Resolve the pending one-time upload result (Go's setOneTimeUploadResult):
+        // the receiver gets Ok(()) or the upload error. The 10s watchdog in
+        // one_time_upload() has already resolved the "never started" case.
+        if is_upload {
+            if let Some(tx) = self.one_time_result.lock().unwrap().take() {
+                let _ = tx.send(result);
+            }
+        }
+
+        // Clear the active handle once the session is finished.
+        *self.active_stop.lock().unwrap() = None;
         self.is_transferring.store(false, Ordering::SeqCst);
         Ok(())
     }
@@ -985,13 +1054,18 @@ impl TransferCtx {
         //   'S' = download, 'R' = upload (choose files), 'D' = upload directory, 'F' = upload specified files
         let directory = trigger.mode == 'D';
         let files_specified = trigger.mode == 'F';
-        // In 'F' mode, files come from client_files/config; directory determined by whether
-        // any file is a directory (matching Go's filesSpecified flow).
+        // Go's chooseUploadPaths returns oneTimeUploadFiles first, then -u files,
+        // then (in F mode) the server's client_files. One-time files are consumed
+        // and cleared here (Go resets filter.oneTimeUploadFiles after reading).
+        let one_time = {
+            let mut guard = self.one_time_files.lock().unwrap();
+            std::mem::take(&mut *guard)
+        };
         let files = if files_specified {
-            // 'F' mode: the client (wrapper) provides the actual files via -u.
-            // config.client_files carries the names the server expects, but the
-            // real paths come from the client's upload_files (-u).
-            if !self.upload_files.is_empty() {
+            if !one_time.is_empty() {
+                one_time
+            } else if !self.upload_files.is_empty() {
+                // 'F' mode: the client (wrapper) provides the actual files via -u.
                 self.check_auto_upload_allowed(&self.upload_files)?;
                 self.upload_files.clone()
             } else if !config.client_files.is_empty() {
@@ -1000,6 +1074,8 @@ impl TransferCtx {
             } else {
                 return Err(anyhow!("No files specified to upload"));
             }
+        } else if !one_time.is_empty() {
+            one_time
         } else if !self.upload_files.is_empty() {
             // R/D mode: client explicitly chose files via -u; no allowed-dir gate
             // (matches Go, where -u in R/D mode bypasses checkAutoUploadAllowed).
@@ -1542,12 +1618,53 @@ mod tests {
     }
 
     #[test]
+    fn test_one_time_upload_slot_plumbing() {
+        // P1: one_time_upload parks a pending result slot; the transfer thread
+        // resolves it (run_transfer sends the result), or the 10s watchdog in
+        // one_time_upload() fires first if no trigger ever arrived.
+        let mut filter = NrzszFilter::new(Config::default());
+        let rx = filter.one_time_upload(vec!["/tmp/nrzsz_t/f.txt".to_string()]);
+        assert_eq!(
+            filter.one_time_upload_files.lock().unwrap().len(),
+            1,
+            "one-time files are shared with the transfer thread"
+        );
+        assert!(filter.one_time_upload_result.lock().unwrap().is_some());
+        // Resolve as run_transfer does after an R/D/F upload completes.
+        filter.set_one_time_upload_result(Ok(()));
+        assert!(filter.one_time_upload_result.lock().unwrap().is_none());
+        assert!(rx.try_recv().is_ok());
+    }
+
+    #[test]
+    fn test_process_input_ctrl_c_during_transfer_stops() {
+        // P4: a local Ctrl+C during a live transfer stops the session in place
+        // instead of being forwarded to the remote (Go handleInputCtrlC).
+        let filter = NrzszFilter::new(Config::default());
+        filter.is_transferring.store(true, Ordering::SeqCst);
+        // Register an active stop handle (run_transfer does this at session start).
+        *filter.active_stop.lock().unwrap() =
+            Some(crate::transfer::TransferStop::new());
+
+        // Raw mode: the 0x03 byte is dropped, other input is still forwarded,
+        // and the running session's stop handle is marked stopped.
+        assert_eq!(filter.process_input(b"ab\x03cd"), b"abcd");
+        let handle = filter.active_stop.lock().unwrap().as_ref().unwrap().clone();
+        assert!(handle.is_stopped());
+
+        // Tmux-CC mode: a `send -t %1 0x3` command is consumed, not forwarded.
+        let cc = b"send -t %1 0x3\r";
+        assert!(filter.process_input(cc).is_empty());
+    }
+
+    #[test]
     fn test_process_input_transferring() {
         let filter = NrzszFilter::new(Config::default());
         filter.is_transferring.store(true, Ordering::SeqCst);
         let result = filter.process_input(b"hello");
         assert_eq!(result, b"hello");
     }
+
     #[test]
     fn test_tunnel_hello_read_does_not_overread() {
         // Regression: the client's server-hello read must not consume bytes of
