@@ -11,7 +11,7 @@ resolver = "2"
 version = "0.1.0"
 edition = "2021"
 authors = ["nrzsz contributors"]
-license = "MIT"
+license = "Apache-2.0"
 description = "A Rust implementation of nrzsz, similar to lrzsz (rz/sz), and compatible with tmux"
 
 [workspace.dependencies]

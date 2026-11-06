@@ -1,6 +1,43 @@
-# nrzsz (nsz / nrz) — trzsz compatible file transfer
+# nrzsz
 
-A Rust implementation of file transfer, similar to `lrzsz` (rz/sz), compatible with `tmux` and `trzsz-go` (trz/tsz) v1.2.0+.
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/rust-1.75%2B-orange.svg)](https://www.rust-lang.org/)
+![Platform: macOS · Linux · Windows](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey)
+
+A Rust implementation of file transfer tools compatible with
+[`trzsz-go`](https://github.com/trzsz/trzsz-go) (`trz` / `tsz`) and inspired
+by [`lrzsz`](https://github.com/trzsz/lrzsz) (`rz` / `sz`). It provides three
+binaries — `nsz` (send), `nrz` (receive) and `nrzsz` (wrapper / relay) — plus
+the `nrzsz-core` library crate.
+
+The project implements the trzsz wire protocol (V1–V4) over a TCP tunnel, with
+tmux support, drag-and-drop upload, resume, compression and ZMODEM passthrough.
+
+> **Status**: implemented, tested and verified against real `trzsz-go` and
+> `lrzsz` binaries. See [AGENTS.md](AGENTS.md) for the complete feature /
+> compatibility matrix and the implementation roadmap.
+
+## Features
+
+- **trzsz wire protocol V1–V4** — version negotiation with automatic downgrade.
+- **Compression** — zstd + zlib, auto-detected (`-c auto/yes/no`).
+- **Resume** — V3 prefix-hash resume (MD5, 10 MB steps).
+- **Directory transfer** — recursive, nested, byte-identical (`-d` / `-r`).
+- **Background fork** — `-f` detaches the transfer to the background.
+- **TCP tunnel** — transfers run over a `::TRZSZ:` tunnel bridge; binary mode
+  and fork work over the tunnel.
+- **tmux support** — normal mode and `-CC` control mode output routing,
+  trigger prefix parsing, drag `%begin`/`%end` acknowledgements.
+- **Drag-and-drop upload** — iTerm2 / Warp / bracketed-paste prefixes.
+- **OSC52 clipboard** — `-o` integrates with the terminal clipboard.
+- **ZMODEM passthrough** — `-z` uses a self-contained ZMODEM engine (no
+  external `rz`/`sz` needed) verified against real `lrzsz` binaries.
+- **Relay mode** — `-r` bridges two hosts through `NrzszRelay`.
+- **Progress UI** — progress bars with optional gradient color pair.
+- **Cross-platform** — macOS, Linux and Windows (build fixed; Windows runtime
+  untested — see [AGENTS.md](AGENTS.md)).
+- **Embedding API** — `NrzszOptions` / `TransferStateHandler` / `NrzszFilter`
+  for programmatic use.
 
 ## Installation
 
@@ -8,7 +45,10 @@ A Rust implementation of file transfer, similar to `lrzsz` (rz/sz), compatible w
 
 ```bash
 cargo build --release
-# Binaries at: target/release/nsz, target/release/nrz, target/release/nrzsz
+# Binaries:
+#   target/release/nsz
+#   target/release/nrz
+#   target/release/nrzsz
 ```
 
 ### Via cargo install
@@ -29,19 +69,19 @@ cp target/release/{nsz,nrz,nrzsz} /usr/local/bin/
 
 ### Send files (local → remote)
 
-**Step 1:** On the **remote** machine, start the receiver:
+**Step 1 — on the remote machine**, start the receiver:
 
 ```bash
 nrz /tmp
 ```
 
-This prints a trigger line like:
+It prints a trigger line such as:
 
 ```
-:::TRZSZ:TRANSFER:R:0.1.0:37692865470000:58263
+::TRZSZ:TRANSFER:R:0.1.0:37692865470000:58263
 ```
 
-**Step 2:** On the **local** machine, send files:
+**Step 2 — on the local machine**, send files:
 
 ```bash
 nsz file1.txt file2.png ./mydir/
@@ -49,13 +89,13 @@ nsz file1.txt file2.png ./mydir/
 
 ### Receive files (remote → local)
 
-**Step 1:** On the **local** machine, start the receiver:
+**Step 1 — on the local machine**, start the receiver:
 
 ```bash
 nrz ~/downloads
 ```
 
-**Step 2:** On the **remote** machine, send files:
+**Step 2 — on the remote machine**, send files:
 
 ```bash
 nsz bigfile.zip
@@ -73,9 +113,13 @@ nrzsz ssh user@host nrz /tmp
 nrzsz ssh user@host nsz file1.txt file2.zip
 ```
 
+`nrzsz` is the client-side wrapper: it detects the server's trigger, opens the
+TCP tunnel and routes the transfer through it.
+
 ### With tmux
 
-Everything works transparently in tmux. The tool automatically detects tmux CC mode and adjusts behavior:
+Everything works transparently inside tmux. The tool auto-detects tmux `-CC`
+control mode and adjusts output encoding accordingly:
 
 ```bash
 # Inside tmux, just use as normal
@@ -85,7 +129,7 @@ nsz myfile.txt
 
 ### With zmodem (lrzsz compatibility)
 
-Enable zmodem passthrough:
+Enable ZMODEM passthrough (raw `rz` / `sz` interop):
 
 ```bash
 nrzsz -z ssh user@host sz file.txt
@@ -101,66 +145,83 @@ nrzsz -r ssh user@host
 
 ## CLI Reference
 
-### `nsz` — Send files
+### `nsz` — send files
 
 ```
 nsz [OPTIONS] [FILES]...
 
 Options:
-  -q, --quiet                Quiet (hide progress bar)
-  -o, --overwrite            Overwrite existing files
-  -b, --binary               Binary transfer mode (faster for binary files)
-  -e, --escape               Escape control characters
-  -d, --directory            Transfer directories
-  -r, --recursive            Same as -d
-  -f, --fork                 Background transfer
-  -c, --compress <TYPE>      Compression: auto / yes / no [default: auto]
-  -B, --bufsize <SIZE>       Buffer chunk size (1K~1G) [default: 10M]
-  -t, --timeout <SECS>       Timeout per chunk (0=never) [default: 20]
-  -V, --version              Print version
+  -q, --quiet                 Quiet (hide progress bar)
+  -o, --overwrite             Overwrite existing files
+  -b, --binary                Binary transfer mode (faster for binary files)
+  -e, --escape                Escape all known control characters
+  -d, --directory             Transfer directories and files
+  -r, --recursive             Same as -d
+  -f, --fork                  Background transfer (implies -q)
+  -c, --compress <TYPE>       Compression: auto/yes/no [default: auto]
+  -B, --bufsize <SIZE>        Max buffer chunk size (1K<=N<=1G) [default: 10M]
+  -t, --timeout <SECS>        Timeout per chunk (<=0 = never) [default: 20]
+  -a, --ascii                 ASCII (text) mode; forces binary off
+      --resume                Resume interrupted file transfer
+  -p, --protect               Skip files that already exist
+  -w, --windowsize <N>        Window size in bytes, capped by -B
+  -Y, --overwrite-or-skip     Overwrite if source newer, otherwise skip
+  -E, --rename                Force rename if file already exists
+  -+, --append                Append to existing files
+  -V, --version               Print version
 ```
 
-### `nrz` — Receive files
+### `nrz` — receive files
 
 ```
 nrz [OPTIONS] [PATH]
 
 Options:
-  -q, --quiet                Quiet (hide progress bar)
-  -o, --overwrite            Overwrite existing files
-  -b, --binary               Binary transfer mode
-  -e, --escape               Escape control characters
-  -d, --directory            Transfer directories
-  -r, --recursive            Same as -d
-  -f, --fork                 Background transfer
-  -c, --compress <TYPE>      Compression: auto / yes / no [default: auto]
-  -B, --bufsize <SIZE>       Buffer chunk size (1K~1G) [default: 10M]
-  -t, --timeout <SECS>       Timeout per chunk (0=never) [default: 20]
-  -V, --version              Print version
+  -q, --quiet                 Quiet (hide progress bar)
+  -o, --overwrite             Overwrite existing files
+  -b, --binary                Binary transfer mode
+  -e, --escape                Escape all known control characters
+  -d, --directory             Transfer directories and files
+  -r, --recursive             Same as -d
+  -f, --fork                  Background transfer (implies -q)
+  -c, --compress <TYPE>       Compression: auto/yes/no [default: auto]
+  -B, --bufsize <SIZE>        Max buffer chunk size (1K<=N<=1G) [default: 10M]
+  -t, --timeout <SECS>        Timeout per chunk (<=0 = never) [default: 20]
+  -a, --ascii                 ASCII (text) mode; forces binary off
+      --resume                Resume interrupted file transfer
+  -p, --protect               Skip files that already exist
+  -w, --windowsize <N>        Window size in bytes, capped by -B
+  -Y, --overwrite-or-skip     Overwrite if source newer, otherwise skip
+  -E, --rename                Force rename if file already exists
+  -+, --append                Append to existing files
+  -F, --file <FILE>           Absolute path of a file/dir to upload (repeatable)
+  -V, --version               Print version
 ```
 
-### `nrzsz` — Wrapper with filter
+### `nrzsz` — wrapper (filter / relay)
 
-Wraps an SSH or other command to intercept trzsz/nrzsz transfer triggers:
+Wraps an SSH or other command to intercept transfer triggers:
 
 ```
 nrzsz [OPTIONS] COMMAND [ARGS...]
 
 Options:
-  -r, --relay                Run as relay server
-  -t, --tracelog             Enable trace log for debugging
-  -d, --dragfile             Enable drag file upload
-  -z, --zmodem               Enable zmodem lrzsz compatibility
-  -o, --osc52                Enable clipboard integration
-  -u, --upload <FILE>        Upload file(s) to remote (repeatable)
-  -D, --download-dir <DIR>   Directory to save downloaded files
-  -V, --version              Print version
+  -h, --help                  Show help and exit
+  -v, --version               Show version and exit
+  -r, --relay                 Run as a relay server
+  -t, --tracelog              Enable trace log for debugging
+  -d, --dragfile              Enable drag file(s) to upload
+  -z, --zmodem                Enable zmodem lrzsz (rz / sz)
+  -E, --rename                zmodem: rename if the target file exists
+  -o, --osc52                 Enable clipboard (OSC52) integration
+  -u, --upload <FILE>         Upload file(s) to remote (repeatable)
+  -D, --download-dir <DIR>    Directory to save downloaded files
 ```
 
 **Examples:**
 
 ```bash
-# Wrap SSH with nrzsz filter
+# Wrap SSH with the nrzsz filter
 nrzsz ssh user@host bash
 
 # Upload specific files on connect
@@ -175,77 +236,151 @@ nrzsz -z ssh user@host bash
 
 ## Configuration
 
-Create `~/.nrzsz.conf` (JSON format):
+The configuration file is `~/.trzsz.conf` (Go-compatible, `key = value`
+format), falling back to `~/.nrzsz.conf` (JSON) and then a legacy
+`~/.nrzsz_legacy.conf` (`key = value`) for compatibility.
 
-```json
-{
-  "allowedAutoUploadDirs": ["/tmp", "/home/user/shared"],
-  "defaultUploadPath": "/tmp",
-  "defaultDownloadPath": "~/downloads",
-  "dragFileUploadCommand": "kitty +kitten icat --transfer-mode=stream",
-  "progressColorPair": "1;32"
-}
-```
+### `~/.trzsz.conf` (Go-compatible, `key = value`)
 
-Legacy `key = value` format is also supported:
-
-```
+```ini
+# Comments start with #
 allowedAutoUploadDirs = /tmp, /home/user/shared
 defaultUploadPath = /tmp
 defaultDownloadPath = ~/downloads
+dragFileUploadCommand = nrz
+progressColorPair = cyan blue
+zmodemAutoRename = on
+```
+
+Keys are matched case-insensitively (lowercased at parse time).
+
+### `~/.nrzsz.conf` (JSON)
+
+```json
+{
+  "defaultUploadPath": "/tmp",
+  "defaultDownloadPath": "~/downloads",
+  "dragFileUploadCommand": "nrz",
+  "progressColorPair": ["cyan", "blue"],
+  "allowedAutoUploadDirs": ["/tmp", "/home/user/shared"],
+  "zmodemAutoRename": false
+}
+```
+
+### Legacy `~/.nrzsz_legacy.conf` (`key = value`)
+
+```ini
+DefaultUploadPath = /tmp
+DefaultDownloadPath = ~/downloads
+DragFileUploadCommand = nrz
+ProgressColorPair = B14FFF 00FFA3
 ```
 
 ## Library API
 
-Use `nrzsz` as a Rust library:
+Use `nrzsz-core` as a Rust library:
 
 ```rust
-use nrzsz::{NrzszOptions, upload_files, download_files, start_relay};
+use nrzsz_core::api::{NrzszOptions, TransferStateHandler};
+use nrzsz_core::filter::NrzszFilter;
+use nrzsz_core::protocol::Config;
 
-// Upload files via TCP tunnel
+// Build a filter from options (wires dragfile/zmodem/osc52 setters)
 let opts = NrzszOptions {
-    path: Some("/remote/path".into()),
-    quiet: false,
+    quiet: true,
+    compress: Some("auto".to_string()),
     ..Default::default()
 };
-upload_files(&opts, &["localfile.txt".into()])?;
+let mut filter: NrzszFilter = opts.build_filter();
 
-// Download files
-download_files(&opts, &["remotefile.txt".into()])?;
+// Wire a transfer-state callback (true = started, false = finished/stopped)
+let mut handler = TransferStateHandler::new();
+handler.set_callback(Box::new(|started| {
+    println!("transfer state: {started}");
+}));
+handler.apply_to(&mut filter);
 
-// Start relay
-start_relay(&relay_opts)?;
+// Caller-side configuration is done with the filter's setters:
+//   filter.set_tunnel_connector(...);
+//   filter.set_upload_files(vec![...]);
+//   filter.set_default_download_path("~/downloads".into());
+
+// Or just build a bare Config:
+let config: Config = opts.to_config();
+```
+
+For relay mode, construct an `NrzszRelay` directly with your own streams:
+
+```rust
+use nrzsz_core::relay::NrzszRelay;
+
+let relay = NrzszRelay::new(client_in, client_out, server_in, server_out);
+relay.run()?;
 ```
 
 ## Compatibility
 
-- `trzsz-go` v1.2.0+ (trz / tsz) — the primary compatibility target. The
-  `::TRZSZ:` wire namespace and protocol V1–V4 are matched.
-- `lrzsz` (rz / sz) — interop via the `-z` zmodem passthrough (implemented):
-  a self-contained ZMODEM engine bridges raw streams to a legacy `rz`/`sz`.
+### trzsz-go (primary target)
 
-## Feature highlights
+`trzsz-go` v1.2.0+ (`trz` / `tsz`) is the primary compatibility target. The
+`::TRZSZ:` wire namespace, protocol V1–V4, JSON framing and the TCP tunnel are
+matched. Both `::TRZSZ:` and the legacy `::NRZSZ:` namespace are accepted.
 
-- **trzsz-go v1.2.0 feature coverage** (see `AGENTS.md` for the full matrix):
-  V1–V4 negotiation, zstd+zlib compression, V3 resume, directory transfer,
-  fork, tunnel, relay, OSC52, drag upload (incl. iTerm2 `%begin`/`%end`),
-  zenity dialogs, tracelog, tmux normal + `-CC` control mode,
-  `~/.trzsz.conf`, progress color gradient, lrzsz-style CLI flags.
-- Protocol V1–V4 with version negotiation and downgrade
-- Zstd + Zlib compression with auto-detection
-- V3 resume (prefix hash at 10MB steps)
-- Directory transfer with recursive mode
-- Background fork transfer
-- OSC52 clipboard support
-- Zmodem passthrough (`-z`): self-contained engine (no external `rz`/`sz`),
-  detects `**\x18B0[01]hex`, sends/receives raw ZMODEM frames, progress +
-  cancel. Verified end-to-end against real lrzsz binaries (upload + download).
-- Drag file upload support (iTerm2 + Warp + bracketed-paste prefixes)
-- Zenity file dialogs
-- tmux normal mode + `-CC` control mode integration
-- Cross-platform (macOS, Linux, Windows; the Windows build is fixed and the
-  ConPTY path is implemented, but runtime on a Windows host is untested here)
+### lrzsz (raw ZMODEM)
+
+`lrzsz` (`rz` / `sz`) is the C reference for raw ZMODEM. `nrzsz` implements
+the trzsz wire protocol (a superset adding JSON config/action framing and a
+TCP tunnel), so direct raw-ZMODEM interop goes through `-z` passthrough: a
+self-contained ZMODEM engine bridges raw streams to a real `rz` / `sz`. The
+engine is verified end-to-end against real `lrzsz` binaries.
+
+### Feature coverage vs trzsz-go
+
+See [AGENTS.md](AGENTS.md) for the full comparison matrix (`§5`), the
+`lrzsz` flag-by-flag comparison (`§6`) and the implementation roadmap (`§3`).
+
+## Project layout
+
+```
+.
+├── nrzsz-core/     # Library crate: protocol, transfer, filter, relay, tmux, zmodem…
+│   ├── src/
+│   │   ├── protocol.rs    # Wire format, Config, framing
+│   │   ├── transfer.rs    # V1–V4 transfer engine
+│   │   ├── filter.rs      # Wrapper (trigger detection, tunnel bridge)
+│   │   ├── relay.rs       # Relay between hosts
+│   │   ├── zmodem.rs      # Self-contained ZMODEM engine (-z)
+│   │   ├── tmux.rs        # tmux normal mode
+│   │   ├── tmuxcc.rs      # tmux -CC control mode
+│   │   └── api.rs         # Embedding API (NrzszOptions, TransferStateHandler)
+│   └── tests/             # Protocol + zmodem e2e tests
+├── nsz/                   # nsz binary (send)
+├── nrz/                   # nrz binary (receive)
+├── nrzsz/                 # nrzsz binary (wrapper / relay)
+├── AGENTS.md              # Full feature / compatibility matrix + roadmap
+└── LICENSE                # Apache-2.0
+```
+
+## Development
+
+```bash
+# Build (release, whole workspace)
+cargo build --release --workspace
+
+# Run the full test suite (unit + protocol + tunnel e2e + relay e2e)
+cargo test --workspace
+
+# ZMODEM smoke tests need lrzsz (sz/rz) on PATH; they are #[ignore]d:
+cargo test --workspace -- --ignored zmodem
+```
 
 ## License
 
-MIT
+Licensed under the [Apache License, Version 2.0](LICENSE).
+
+## Acknowledgements
+
+- [trzsz-go](https://github.com/trzsz/trzsz-go) — wire-protocol compatibility
+  target.
+- [lrzsz](https://github.com/trzsz/lrzsz) — the original `rz` / `sz`; ZMODEM
+  reference used to validate the passthrough engine.

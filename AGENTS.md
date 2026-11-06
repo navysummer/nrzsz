@@ -9,6 +9,68 @@ Every claim below is grounded in source inspection (`/tmp/trzsz-go/...`,
 `/tmp/lrzsz/src/{lsz.c,lrz.c,zmodem.txt}`, `nrzsz-core/src/*.rs`) or a
 verified test run on this host.
 
+
+---
+
+## 0. Implementation status summary
+
+This section is the canonical, at-a-glance status of every feature area. It is
+kept in sync with the rest of the document: details live in the corresponding
+sections below, this table only states the status and where to read more.
+
+### 0.1 Implemented & verified
+
+| Area | Status | Verified by | Details |
+|---|---|---|---|
+| Wire format `::TRZSZ:TRANSFER:[SRDF]:VER:UID:PORT` (+ `::NRZSZ:` legacy) | ✅ | trigger parse + emit, dual namespace | §1.1 |
+| Action/Config/Data/Exit framing (`#ACT:`, `#CFG:`, `DATA`, `EXIT`/`FAIL`) | ✅ | `protocol.rs`, `transfer.rs` | §1.1 |
+| Protocol V1–V4 negotiation + downgrade | ✅ | `negotiate_protocol_version` | §1.1 |
+| Compression zstd + zlib, auto-detect, `-c auto/yes/no` | ✅ | `compress.rs`, magic-byte detect | §1.1 |
+| V3 prefix-hash resume (MD5, 10 MB steps) | ✅ | `send/recv_prefix_hash` | §1.1 |
+| Directory transfer `-d/-r` (nested, byte-identical) | ✅ | `diff` clean | §1.1 |
+| Background fork `-f` (over tunnel) | ✅ | `fork.rs`, advertised over tunnel | §1.1, §4.5 |
+| Adaptive buffer 1K–1G (`-B`), timeout (`-t`) | ✅ | `transfer.rs` | §1.1 |
+| Binary (`-b`) + escape (`-e`) modes | ✅ | `utils.rs::escape_data` | §1.1 |
+| Filter mode (trigger detect, stdin forward) | ✅ | `NrzszFilter` | §1.2 |
+| Relay mode (`-r`) | ✅ | handshake verified | §1.2 |
+| Tunnel bridge over TCP | ✅ | `::TRZSZ::CLIENT::SERVER::HELLO` | §1.2 |
+| Tracelog (`-t`) | ✅ | `TraceLogger` wired into relay | §1.2 |
+| OSC52 clipboard (`-o`) | ✅ | `Osc52Clipboard` | §1.2 |
+| Drag-file upload (`-d`) | ✅ | `detect_drag_files` | §1.2 |
+| ZMODEM passthrough (`-z`) — self-contained engine | ✅ | vs real lrzsz `sz`/`rz` | §1.3 |
+| tmux normal + `-CC` control mode | ✅ | `TmuxOutputRedirect`, trigger prefix parse | §1.4 |
+| iTerm2 drag `%begin`/`%end` acks | ✅ | `upload_drag_files` | §1.4 |
+| `~/.trzsz.conf` Go config | ✅ | `config.rs::load_trzsz_conf` | §1.4 |
+| `ProgressColorPair` gradient (Luv space) | ✅ | `BlendLuv`, matches go-colorful | §1.4 |
+| lrzsz-style flags `-a -r -p -w -Y -E -+` | ✅ | all verified end-to-end | §4.4 |
+| Embedding API (`NrzszOptions`, `TransferStateHandler`) | ✅ | `api.rs`, tests | §4.9 |
+| Stop / transfer-control plumbing | ✅ | `TransferStop` shared handle | §4.6 |
+| Windows build fix | ✅ (compile) | `windows-sys` symbols | §1.4, §4.3 |
+| Relay + tunnel hello desync fix | ✅ | filter+relay e2e harness | §4.8 |
+| Download-direction e2e harness | ✅ | `nsz/tests/tunnel_download_e2e.rs` | §4.7 |
+
+### 0.2 Pending / not yet implemented
+
+| Area | Status | Reason / where it will land | Details |
+|---|---|---|---|
+| V4 directory archive (Go groups a dir's files into one streamed `SubFiles` entry) | ⏳ not implemented | nrzsz sends each file individually (correct, only a wire-size optimization) | §3 |
+| Non-tunnel fallback (Go can fall back to raw terminal streams when no connector is set) | ⏳ design choice | nrzsz always transfers over the TCP tunnel | §3 |
+| Relay + `-o`/`-u`/`-D` | ⏳ not supported | relay only bridges (matches Go — relay does tracelog only) | §3 |
+| Windows runtime (ConPTY, `binary=false`, newline `!\n`) | ⏳ untested | no Windows host available; build compiles | §3 |
+
+### 0.3 To improve / divergence
+
+| Area | Status | Note | Details |
+|---|---|---|---|
+| `-Y` semantics vs lrzsz | ⚠️ deliberate divergence | nrzsz `-Y` = overwrite-if-newer; lrzsz `-Y` = clobber + skip-if-not-found (`ZF1_ZMSKNOLOC`) | §3 |
+| zmodem auto-rename (`-E`) | ⚠️ partial | `ZmodemProxy` stubs retained; auto-rename via `resolve_dest` exists | §5 |
+
+### 0.4 To fix / watch
+
+| Area | Status | Note | Details |
+|---|---|---|---|
+| No open defects | ✅ none known | last full pass: `cargo test --workspace` clean, build clean | §9 |
+
 ---
 
 ## 1. What is done and verified
