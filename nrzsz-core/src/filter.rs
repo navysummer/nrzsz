@@ -319,6 +319,7 @@ pub struct NrzszFilter {
     client_out: Arc<Mutex<Box<dyn std::io::Write + Send>>>,
     server_in: Arc<Mutex<Box<dyn std::io::Write + Send>>>,
     active_stop: Arc<std::sync::Mutex<Option<Arc<crate::transfer::TransferStop>>>>,
+    drag_files: Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 impl NrzszFilter {
@@ -355,6 +356,7 @@ impl NrzszFilter {
             client_out: Arc::new(Mutex::new(Box::new(std::io::sink()))),
             server_in: Arc::new(Mutex::new(Box::new(std::io::sink()))),
             active_stop: Arc::new(std::sync::Mutex::new(None)),
+            drag_files: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 
@@ -393,6 +395,11 @@ impl NrzszFilter {
 
     pub fn set_enable_dragfile(&mut self, enable: bool) {
         self.enable_dragfile = enable;
+    }
+
+    pub fn set_drag_files(&mut self, files: Vec<String>) {
+        let mut guard = self.drag_files.lock().unwrap();
+        *guard = files;
     }
 
     pub fn set_terminal_columns(&mut self, columns: i32) {
@@ -762,6 +769,7 @@ impl NrzszFilter {
             active_stop: self.active_stop.clone(),
             one_time_files: self.one_time_upload_files.clone(),
             one_time_result: self.one_time_upload_result.clone(),
+            drag_files: self.drag_files.clone(),
         }
     }
     
@@ -809,6 +817,18 @@ impl NrzszFilter {
                 };
             if raw_ctrl || tmux_cc_ctrl {
                 self.stop_transferring(false);
+                // Emit tmux-CC %begin/%end ack so progress UI desyncs (matching Go's tmuxcc.go:198-206)
+                if tmux_cc_ctrl {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    let ack = format!("%begin {} 1 1\r\n%end {} 1 1\r\n", now, now);
+                    if let Ok(mut w) = self.client_out.lock() {
+                        let _ = w.write_all(ack.as_bytes());
+                        let _ = w.flush();
+                    }
+                }
             }
             // Raw: drop the Ctrl+C byte, forward the rest. Tmux-CC: the
             // `send 0x3` command is a local stop, so it is consumed, not
@@ -831,7 +851,9 @@ impl NrzszFilter {
             let drag_info = detect_drag_files(buf);
             if !drag_info.files.is_empty() {
                 debug!("Detected drag files: {:?}", drag_info.files);
-                let files = drag_info.files.clone();
+                // Store drag files so upload_files_to can pick them up (matching Go's addDragFiles)
+                let mut guard = self.drag_files.lock().unwrap();
+                *guard = drag_info.files.clone();
                 let has_dir = drag_info.has_dir;
                 let tmux_pane_id = drag_info.tmux_pane_id.clone();
                 let tmux_blocks = drag_info.tmux_blocks;
@@ -841,15 +863,15 @@ impl NrzszFilter {
                 let interrupting = self.interrupting.clone();
                 let skip = self.skip_upload_command.clone();
                 let current_cmd = self.current_upload_command.clone();
-
                 let server_in = self.server_in.clone();
 
-                std::thread::spawn(move || {
-                    upload_drag_files(&files, has_dir, &upload_cmd, cmd_not_trz,
-                                      &is_transferring, &interrupting, &skip, &current_cmd,
-                                      server_in, &tmux_pane_id, tmux_blocks);
-                });
-
+                if !self.is_transferring.load(Ordering::SeqCst) {
+                    std::thread::spawn(move || {
+                        upload_drag_files(&drag_info.files, has_dir, &upload_cmd, cmd_not_trz,
+                                          &is_transferring, &interrupting, &skip, &current_cmd,
+                                          server_in, &tmux_pane_id, tmux_blocks);
+                    });
+                }
                 return Vec::new();
             }
         }
@@ -950,6 +972,7 @@ struct TransferCtx {
     active_stop: Arc<std::sync::Mutex<Option<Arc<crate::transfer::TransferStop>>>>,
     one_time_files: Arc<std::sync::Mutex<Vec<String>>>,
     one_time_result: Arc<std::sync::Mutex<Option<std::sync::mpsc::Sender<Result<()>>>>>,
+    drag_files: Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 impl TransferCtx {
@@ -1030,16 +1053,15 @@ impl TransferCtx {
     
     fn download_files_from(&self, session: &mut TransferSession, trigger: &NrzszTrigger) -> Result<()> {
         // Client is the receiver (server nsz is sending)
-        session.send_action(true, &trigger.version, false, true)?;
-        let config = session.recv_config()?;
-        
+        let remote_is_windows = crate::protocol::is_windows_unique_id(&trigger.unique_id);
+        session.send_action(true, &trigger.version, remote_is_windows, true)?;
         let dest = if self.default_download_path.is_empty() {
             std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
         } else {
             PathBuf::from(&self.default_download_path)
         };
         
-        let local_list = session.recv_files(&dest, config.quiet)?;
+        let local_list = session.recv_files(&dest, self.config.quiet)?;
         let msg = TransferSession::format_saved_files(local_list.len(), &dest, &local_list);
         session.client_exit(&msg)?;
         Ok(())
@@ -1047,7 +1069,8 @@ impl TransferCtx {
     
     fn upload_files_to(&self, session: &mut TransferSession, trigger: &NrzszTrigger) -> Result<()> {
         // Client is the sender (server nrz is receiving)
-        session.send_action(true, &trigger.version, false, true)?;
+        let remote_is_windows = crate::protocol::is_windows_unique_id(&trigger.unique_id);
+        session.send_action(true, &trigger.version, remote_is_windows, true)?;
         let config = session.recv_config()?;
         
         // Mode semantics (matching Go's handleTrzsz):
@@ -1064,6 +1087,9 @@ impl TransferCtx {
         let files = if files_specified {
             if !one_time.is_empty() {
                 one_time
+            } else if !self.drag_files.lock().unwrap().is_empty() {
+                // Drag files take priority (matching Go's chooseUploadPaths which checks dragFiles)
+                self.drag_files.lock().unwrap().clone()
             } else if !self.upload_files.is_empty() {
                 // 'F' mode: the client (wrapper) provides the actual files via -u.
                 self.check_auto_upload_allowed(&self.upload_files)?;
@@ -1076,6 +1102,9 @@ impl TransferCtx {
             }
         } else if !one_time.is_empty() {
             one_time
+        } else if !self.drag_files.lock().unwrap().is_empty() {
+            // Drag files in R/D mode too
+            self.drag_files.lock().unwrap().clone()
         } else if !self.upload_files.is_empty() {
             // R/D mode: client explicitly chose files via -u; no allowed-dir gate
             // (matches Go, where -u in R/D mode bypasses checkAutoUploadAllowed).
@@ -1322,7 +1351,7 @@ fn upload_drag_files(
     files: &[String],
     has_dir: bool,
     upload_command: &str,
-    cmd_not_trz: bool,
+    _cmd_not_trz: bool,
     is_transferring: &Arc<AtomicBool>,
     interrupting: &Arc<AtomicBool>,
     skip_upload_command: &Arc<AtomicBool>,
@@ -1375,7 +1404,14 @@ fn upload_drag_files(
     } else {
         upload_command.to_string()
     };
-    if has_dir && !cmd_not_trz {
+    // Check if command is trz-like by shlex-splitting and checking basename (matching Go's filter.go:238-244)
+    let first_token = upload_command.split_whitespace().next().unwrap_or(&upload_command);
+    let cmd_basename = std::path::Path::new(first_token)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let cmd_not_trz_fixed = !cmd_basename.contains("trz");
+    if has_dir && cmd_not_trz_fixed {
         command = format!("{} -d", command);
     }
 

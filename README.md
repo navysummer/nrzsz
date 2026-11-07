@@ -22,7 +22,9 @@ tmux support, drag-and-drop upload, resume, compression and ZMODEM passthrough.
 - **trzsz wire protocol V1–V4** — version negotiation with automatic downgrade.
 - **Compression** — zstd + zlib, auto-detected (`-c auto/yes/no`).
 - **Resume** — V3 prefix-hash resume (MD5, 10 MB steps).
-- **Directory transfer** — recursive, nested, byte-identical (`-d` / `-r`).
+- **Directory transfer** — recursive, nested, byte-identical (`-d` / `-r`);
+  V4 groups a directory's files into one streamed archive entry per top-level
+  path (Go `SubFiles` parity, wire-size optimization).
 - **Background fork** — `-f` detaches the transfer to the background.
 - **TCP tunnel** — transfers run over a `::TRZSZ:` tunnel bridge; binary mode
   and fork work over the tunnel.
@@ -31,7 +33,8 @@ tmux support, drag-and-drop upload, resume, compression and ZMODEM passthrough.
 - **Drag-and-drop upload** — iTerm2 / Warp / bracketed-paste prefixes.
 - **OSC52 clipboard** — `-o` integrates with the terminal clipboard.
 - **ZMODEM passthrough** — `-z` uses a self-contained ZMODEM engine (no
-  external `rz`/`sz` needed) verified against real `lrzsz` binaries.
+  external `rz`/`sz` needed) verified against real `lrzsz` binaries; `-E`
+  auto-renames an existing destination (`name.N`) instead of overwriting.
 - **Relay mode** — `-r` bridges two hosts through `NrzszRelay`.
 - **Progress UI** — progress bars with optional gradient color pair.
 - **Cross-platform** — macOS, Linux and Windows (build fixed; Windows runtime

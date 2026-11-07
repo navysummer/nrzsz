@@ -271,7 +271,7 @@ impl TransferSession {
             confirm,
             version: version.to_string(),
             support_dir: true,
-            protocol: PROTOCOL_VERSION,
+            protocol: if crate::protocol::needs_protocol_downgrade(version) { 2 } else { PROTOCOL_VERSION },
             newline: "\n".to_string(),
             // Go: TunnelConnected is advertised only when the tunnel is connected.
             tunnel: Some(tunnel_connected),
@@ -912,26 +912,32 @@ impl TransferSession {
         if target.append {
             return Ok((file.size, false));
         }
-        
-        
+
+        // V4 archive: the stream is headers+content, so prefix-hash resume
+        // does not apply (Go's sendFileNameV3 only runs sendPrefixHash for
+        // non-archive files; the archive reader has no backing file).
+        if file.archive {
+            return Ok((file.size, false));
+        }
+
         // Prefix hash exchange for resume support
         if target.size > 0 && file.size > 0 {
             if self.negotiated_protocol < crate::protocol::PROTOCOL_V4 {
                 // V3: send SIZE without ack (original file size) — matching nrzsz-go
                 send_integer(&mut self.stdout, "SIZE", file.size as i64, &self.config.newline)?;
             }
-            
+
             let mut f = File::open(Path::new(&file.abs_path))?;
             // Go uses min(srcFile.Size, tgtFile.Size) for the hash comparison range
             let hash_size = file.size.min(target.size.max(0) as u64);
             let matched_step = self.send_prefix_hash(&mut f, hash_size)?;
-            
+
             // Seek file to matched position for resume
             if matched_step > 0 {
                 use std::io::Seek;
                 f.seek(std::io::SeekFrom::Start(matched_step))?;
             }
-            
+
             Ok((file.size - matched_step, false))
         } else {
             Ok((file.size, false))
@@ -940,8 +946,12 @@ impl TransferSession {
     
     /// V3+ file name exchange with prefix hash for resume
     /// Receives full FileInfo JSON (Go's recvFileNameV3 always parses sourceFile JSON),
-    /// creates file, sends TargetFile JSON, then does prefix hash exchange
-    pub fn recv_file_name_v3(&mut self, dest_path: &Path) -> Result<(Option<File>, String, String, u64)> {
+    /// creates file, sends TargetFile JSON, then does prefix hash exchange.
+    ///
+    /// Returns `(file, local_name, file_name, remaining_size, is_archive)`.
+    /// `is_archive` is true for a V4 archive entry: the caller must feed the
+    /// incoming stream to an [`ArchiveWriter`] instead of a plain file.
+    pub fn recv_file_name_v3(&mut self, dest_path: &Path) -> Result<(Option<File>, String, String, u64, bool)> {
         let mut buf = Vec::new();
         let file_json = recv_string(&mut self.stdin, "NAME", &mut buf, &self.config.newline)?;
         let src_file: FileInfo = serde_json::from_str(&file_json)?;
@@ -986,7 +996,7 @@ impl TransferSession {
                     append: false,
                 };
                 send_string(&mut self.stdout, "SUCC", &serde_json::to_string(&target)?, &self.config.newline)?;
-                return Ok((None, local_name, file_name, 0));
+                return Ok((None, local_name, file_name, 0, false));
             }
             if self.config.overwrite_newer {
                 // lrzsz `-Y`/`Lskipnocor`: overwrite only if the source is newer.
@@ -1007,7 +1017,7 @@ impl TransferSession {
                         append: false,
                     };
                     send_string(&mut self.stdout, "SUCC", &serde_json::to_string(&target)?, &self.config.newline)?;
-                    return Ok((None, local_name, file_name, 0));
+                    return Ok((None, local_name, file_name, 0, false));
                 }
                 // Source is newer: overwrite at the natural path (truncate).
                 self.config.overwrite = true;
@@ -1028,13 +1038,31 @@ impl TransferSession {
             };
             send_string(&mut self.stdout, "SUCC", &serde_json::to_string(&target)?, &self.config.newline)?;
             // Sender sends only the tail (file.size - append_offset). No prefix hash.
-            return Ok((Some(file), natural_name, file_name, src_file.size as u64));
+            return Ok((Some(file), natural_name, file_name, src_file.size as u64, false));
         }
         
         
+        // ---- V4 archive: the root is a directory; the stream that follows
+        // contains the sub-files (headers + content). Create the root dir,
+        // send SUCC, skip prefix hash (Go's createDirOrFile returns an
+        // archiveFileWriter and recvFileNameV3 skips recvPrefixHash for it).
+        if src_file.archive {
+            let root = dest_path.join(&local_name);
+            fs::create_dir_all(&root)?;
+            self.created_files.push(root.clone());
+            let target = crate::protocol::TargetFile {
+                name: local_name.clone(),
+                size: 0,
+                skip: false,
+                append: false,
+            };
+            send_string(&mut self.stdout, "SUCC", &serde_json::to_string(&target)?, &self.config.newline)?;
+            return Ok((None, local_name, file_name, 0, true));
+        }
+
         // ---- Normal create (without truncation for resume support) ----
         let (mut file, local_name, file_name) = self.create_dir_or_file_v3(dest_path, &src_file)?;
-        
+
         // Get file size for target file response
         let mut tgt_size: u64 = 0;
         if let Some(ref f) = file {
@@ -1042,7 +1070,7 @@ impl TransferSession {
                 tgt_size = metadata.len();
             }
         }
-        
+
         // Send target file JSON (name + size)
         let target = crate::protocol::TargetFile {
             name: local_name.clone(),
@@ -1052,7 +1080,7 @@ impl TransferSession {
         };
         let target_json = serde_json::to_string(&target)?;
         send_string(&mut self.stdout, "SUCC", &target_json, &self.config.newline)?;
-        
+
         // Do prefix hash exchange if file exists and size > 0
         let remaining_size = if let Some(ref mut f) = file {
             if tgt_size > 0 && src_file.size > 0 {
@@ -1068,8 +1096,8 @@ impl TransferSession {
         } else {
             0
         };
-        
-        Ok((file, local_name, file_name, remaining_size))
+
+        Ok((file, local_name, file_name, remaining_size, false))
     }
     
     pub fn send_file_size(&mut self, file_path: &Path) -> Result<u64> {
@@ -1161,6 +1189,31 @@ impl TransferSession {
         let compress = compressed_count < threshold + 1;
         send_string(&mut self.stdout, "COMP", &compress.to_string(), &self.config.newline)?;
         Ok(compress)
+    }
+
+    /// Send the SIZE integer for a V4 archive entry (stream total size).
+    fn send_file_size_for_archive(&mut self, file: &FileInfo) -> Result<u64> {
+        let size = archive_stream_size(&file.sub_files)?;
+        send_integer(&mut self.stdout, "SIZE", size as i64, &self.config.newline)?;
+        check_integer(&mut self.stdin, size as i64, &mut Vec::new(), &self.config.newline)?;
+        Ok(size)
+    }
+
+    /// Send the COMP flag for a V4 archive entry.
+    ///
+    /// Go's `sendCompressFlag` samples the reader; for an archive (no backing
+    /// file) `isCompressionProfitable` returns true, so we compress. The
+    /// receiver is told via the same `is_compress_fixed` size rule.
+    fn send_compress_flag_for_archive(&mut self, file: &FileInfo) -> Result<bool> {
+        let size = archive_stream_size(&file.sub_files)?;
+        let (fixed, compress) = self.is_compress_fixed(size);
+        if fixed {
+            return Ok(compress);
+        }
+        // For a non-fixed archive stream, sampling would need a real file; Go
+        // treats a nil-backed reader as compressible. Always compress here.
+        send_string(&mut self.stdout, "COMP", &true.to_string(), &self.config.newline)?;
+        Ok(true)
     }
     
     /// Receive compression flag for a file (V3+)
@@ -1333,11 +1386,21 @@ impl TransferSession {
             use std::io::Seek;
             file.seek(std::io::SeekFrom::Start(start_offset))?;
         }
+        self.send_data_with_compress(&mut file, size, progress, use_compress)
+    }
+
+    /// Send a data stream with explicit compression flag (V3+ compatible).
+    ///
+    /// `reader` may be any byte source (a single file, or an archive stream).
+    /// `size` is the total uncompressed byte count. Returns the MD5 of the
+    /// uncompressed bytes (matching Go's `sendFileDataV2`, which hashes the
+    /// source, not the compressed wire bytes).
+    pub fn send_data_with_compress(&mut self, reader: &mut dyn Read, size: u64, progress: &TransferProgress, use_compress: bool) -> Result<Vec<u8>> {
         let mut buf_size: usize = 1024; // Start small for fast start
         let mut buf = vec![0u8; buf_size];
         let mut md5_hash = md5::Context::new();
         let mut sent = 0u64;
-        
+
         let compress_type = if use_compress && self.can_use_compress() {
             match &self.config.compress {
                 crate::protocol::CompressType::Auto => crate::compress::CompressAlgo::Zstd,
@@ -1347,23 +1410,23 @@ impl TransferSession {
         } else {
             crate::compress::CompressAlgo::None
         };
-        
+
         let buf_cap = self.effective_buf_cap();
-        
+
         while sent < size {
             // V3: check stop/pause before each chunk (sends pause markers if pausing)
             if self.negotiated_protocol >= crate::protocol::PROTOCOL_V3 {
                 self.check_stop_and_pause("DATA")?;
             }
             let chunk_start = std::time::Instant::now();
-            
-            let bytes_read = file.read(&mut buf)?;
+
+            let bytes_read = reader.read(&mut buf)?;
             if bytes_read == 0 {
                 break;
             }
-            
+
             let data = &buf[..bytes_read];
-            
+
             let (compressed_data, _was_compressed) = if compress_type != crate::compress::CompressAlgo::None {
                 // The negotiated compression mode is the wire contract (Go's
                 // pipelineEncodeData): once compression is on, every chunk is
@@ -1373,7 +1436,7 @@ impl TransferSession {
             } else {
                 (data.to_vec(), false)
             };
-            
+
             if self.config.binary {
                 let escaped = escape_data(&compressed_data, &self.config.escape_chars);
                 send_line(&mut self.stdout, "DATA", &escaped.len().to_string(), &self.config.newline)?;
@@ -1381,15 +1444,15 @@ impl TransferSession {
             } else {
                 send_binary(&mut self.stdout, "DATA", &compressed_data, &self.config.newline)?;
             }
-            
+
             md5_hash.consume(data);
-            
+
             // V2/V3 ack format: length/step
             check_pipeline_ack(&mut self.stdin, compressed_data.len() as i64, &mut Vec::new(), &self.config.newline)?;
-            
+
             sent += bytes_read as u64;
             progress.update(sent);
-            
+
             // Time-based buffer adaptation (matching nrzsz-go)
             let chunk_time = chunk_start.elapsed();
             self.set_last_chunk_time(chunk_time);
@@ -1403,15 +1466,27 @@ impl TransferSession {
                 buf.resize(buf_size, 0);
             }
         }
-        
+
         Ok(md5_hash.compute().to_vec())
     }
     
-    /// Receive file data with explicit compression flag (V3+ compatible)
+    /// Receive file data with explicit compression flag (V3+ compatible).
+    ///
+    /// Delegates to [`TransferSession::recv_data_with_compress`] with a single
+    /// file as the destination writer.
     pub fn recv_file_data_with_compress(&mut self, file: &mut File, size: u64, progress: &TransferProgress, use_compress: bool) -> Result<Vec<u8>> {
+        self.recv_data_with_compress(file, size, progress, use_compress)
+    }
+
+    /// Receive a data stream with explicit compression flag (V3+ compatible).
+    ///
+    /// `writer` receives the uncompressed bytes (a single file, or an archive
+    /// parser that splits the stream back into files). Returns the MD5 of the
+    /// uncompressed bytes (matching Go's `recvFileDataV2`).
+    pub fn recv_data_with_compress(&mut self, writer: &mut dyn Write, size: u64, progress: &TransferProgress, use_compress: bool) -> Result<Vec<u8>> {
         let mut md5_hash = md5::Context::new();
         let mut received = 0u64;
-        
+
         let mut compress_type = if use_compress && self.can_use_compress() {
             match &self.config.compress {
                 crate::protocol::CompressType::Auto => crate::compress::CompressAlgo::Zstd,
@@ -1422,13 +1497,13 @@ impl TransferSession {
             crate::compress::CompressAlgo::None
         };
         let mut first_chunk = true;
-        
+
         while received < size {
             // Check for stop
             if self.is_stopped() {
                 return Err(anyhow!("Transfer stopped"));
             }
-            
+
             let compressed_data = if self.config.binary {
                 let mut buf = Vec::new();
                 let line = recv_line(&mut self.stdin, &mut buf, &self.config.newline)?;
@@ -1450,29 +1525,29 @@ impl TransferSession {
                 let mut buf = Vec::new();
                 recv_binary(&mut self.stdin, "DATA", &mut buf, &self.config.newline)?
             };
-            
+
             if first_chunk && compress_type == crate::compress::CompressAlgo::None {
                 compress_type = crate::compress::detect_compress_type(&compressed_data);
                 first_chunk = false;
             }
-            
+
             let data = if compress_type != crate::compress::CompressAlgo::None {
                 crate::compress::decompress_data(&compressed_data, compress_type)?
             } else {
                 compressed_data.clone()
             };
-            
-            file.write_all(&data)?;
+
+            writer.write_all(&data)?;
             md5_hash.consume(&data);
-            
+
             // V2/V3 ack format: length/step
             send_pipeline_ack(&mut self.stdout, compressed_data.len() as i64, received as i64, &self.config.newline)?;
-            
+
             // Track uncompressed data size
             received += data.len() as u64;
             progress.update(received);
         }
-        
+
         Ok(md5_hash.compute().to_vec())
     }
     
@@ -1496,30 +1571,56 @@ impl TransferSession {
     pub fn send_files(&mut self, file_list: &[FileInfo], quiet: bool) -> Result<Vec<String>> {
         // Save tmux status interval before transfer
         self.save_tmux_status_interval();
-        
-        self.send_file_num(file_list.len())?;
-        
+
+        // V4: group same-path_id descendants into archive entries (Go's
+        // archiveSourceFiles) so a directory transfer streams as one entry.
+        let grouped = if self.negotiated_protocol >= crate::protocol::PROTOCOL_V4 {
+            archive_source_files(file_list, self.negotiated_protocol, self.config.overwrite)
+        } else {
+            file_list.to_vec()
+        };
+
+        self.send_file_num(grouped.len())?;
+
         let mut remote_list = Vec::new();
-        
-        for file in file_list {
+
+        for file in &grouped {
             if self.negotiated_protocol >= crate::protocol::PROTOCOL_V3 {
                 // V3: send full file info JSON, receive target file JSON, do prefix hash
                 let (remaining_size, skipped) = self.send_file_name_v3(file)?;
-                
+
                 let remote_name = file.path_name.last().unwrap().clone();
                 if !skipped && !remote_list.contains(&remote_name) {
                     remote_list.push(remote_name);
                 }
-                
-                if file.is_dir {
+
+                if file.is_dir && !file.archive {
                     continue;
                 }
-                
+
                 // Receiver refused the file (protect / not-newer): no data follows.
                 if skipped {
                     continue;
                 }
-                
+
+                if file.archive {
+                    // V4 archive: stream the sub-files as one SIZE + DATA.
+                    let size = self.send_file_size_for_archive(file)?;
+                    let use_compress = self.send_compress_flag_for_archive(file)?;
+                    let display_name = file.path_name.join("/");
+                    let progress = TransferProgress::new_with_color(
+                        size,
+                        quiet,
+                        Some(display_name),
+                        self.config.color_pair_option(),
+                    );
+                    let mut reader = ArchiveReader::new(file.sub_files.clone());
+                    let md5 = self.send_data_with_compress(&mut reader, size, &progress, use_compress)?;
+                    self.send_file_md5(&md5)?;
+                    progress.finish("Done");
+                    continue;
+                }
+
                 // V3: send SIZE with ack (remaining size after prefix hash)
                 // Go sends srcSize - matchStep as the SIZE value
                 let size = if remaining_size < file.size {
@@ -1528,12 +1629,12 @@ impl TransferSession {
                 } else {
                     self.send_file_size(Path::new(&file.abs_path))?
                 };
-                
+
                 // Use remaining_size for data transfer if prefix hash matched
                 let data_size = if remaining_size < file.size { remaining_size } else { size };
                 // Resume offset = file.size - data_size (matched_step when resuming, 0 otherwise)
                 let start_offset = file.size.saturating_sub(data_size);
-                
+
                 let use_compress = self.send_compress_flag(Path::new(&file.abs_path))?;
                 let display_name = file.path_name.join("/");
                 let progress = TransferProgress::new_with_color(
@@ -1551,14 +1652,14 @@ impl TransferSession {
                 if !remote_list.contains(&remote_name) {
                     remote_list.push(remote_name);
                 }
-                
+
                 if file.is_dir {
                     continue;
                 }
-                
+
                 // V2: send size and data
                 let size = self.send_file_size(Path::new(&file.abs_path))?;
-                
+
                 let (fixed, compress) = self.is_compress_fixed(size);
                 let use_compress = if fixed { compress } else { false };
                 let progress = TransferProgress::new_with_color(
@@ -1572,39 +1673,62 @@ impl TransferSession {
                 progress.finish("Done");
             }
         }
-        
+
         // Restore tmux status interval after transfer
         self.restore_tmux_status_interval();
-        
+
         Ok(remote_list)
     }
     
     pub fn recv_files(&mut self, dest_path: &Path, quiet: bool) -> Result<Vec<String>> {
         // Save tmux status interval before transfer
         self.save_tmux_status_interval();
-        
+
         let num = self.recv_file_num()?;
         let mut local_list = Vec::new();
-        
+
         for _ in 0..num {
-            let (file, local_name, _file_name, _remaining_size) = if self.negotiated_protocol >= crate::protocol::PROTOCOL_V3 {
+            let (file, local_name, _file_name, _remaining_size, is_archive) = if self.negotiated_protocol >= crate::protocol::PROTOCOL_V3 {
                 // V3: receive full file info JSON, send target file JSON, do prefix hash
                 self.recv_file_name_v3(dest_path)?
             } else {
                 // V2: receive filename, remaining_size is placeholder
                 let (f, ln, fn_) = self.recv_file_name(dest_path)?;
-                (f, ln, fn_, 0)
+                (f, ln, fn_, 0, false)
             };
-            
+
             if !local_list.contains(&local_name) {
                 local_list.push(local_name.clone());
             }
-            
+
+            // V4 archive: the stream is headers+content; feed it to an
+            // ArchiveWriter which splits it back into the destination files.
+            if is_archive {
+                let size = self.recv_file_size()?;
+                let use_compress = self.recv_compress_flag(size)?;
+                let progress = TransferProgress::new_with_color(
+                    size,
+                    quiet,
+                    Some(local_name.clone()),
+                    self.config.color_pair_option(),
+                );
+                let mut writer = ArchiveWriter::new(
+                    dest_path.to_path_buf(),
+                    local_name.clone(),
+                    self.config.clone(),
+                );
+                let md5 = self.recv_data_with_compress(&mut writer, size, &progress, use_compress)?;
+                self.recv_file_md5(&md5)?;
+                self.created_files.extend(writer.finish());
+                progress.finish("Done");
+                continue;
+            }
+
             let mut file = match file {
                 Some(f) => f,
                 None => continue,
             };
-            
+
             if self.negotiated_protocol >= crate::protocol::PROTOCOL_V3 {
                 // V3: recv_file_name_v3 handles NAME, TARGET, SIZE (no ack), prefix hash
                 // Now receive SIZE with ack (remaining size) — matching nrzsz-go recvFileSize
@@ -1634,10 +1758,10 @@ impl TransferSession {
                 progress.finish("Done");
             }
         }
-        
+
         // Restore tmux status interval after transfer
         self.restore_tmux_status_interval();
-        
+
         Ok(local_list)
     }
     
@@ -1826,6 +1950,333 @@ impl TransferSession {
     }
 }
 
+/// Group a flat file list into V4 archive entries.
+///
+/// Go's `archiveSourceFiles` keeps one entry per distinct `PathID` and moves
+/// every later file with the same `PathID` into that entry's `SubFiles`. This
+/// means a directory transfer becomes one streamed archive per top-level
+/// source path instead of N separate files (wire-size optimization only; the
+/// bytes are identical either way).
+///
+/// Only applies when `overwrite` is off, the negotiated protocol is V4+, and
+/// a directory is involved. Otherwise the list is returned unchanged.
+pub fn archive_source_files(file_list: &[FileInfo], protocol: u32, overwrite: bool) -> Vec<FileInfo> {
+    if overwrite || protocol < crate::protocol::PROTOCOL_V4 || file_list.is_empty() {
+        return file_list.to_vec();
+    }
+
+    let max_path_id = file_list.iter().map(|f| f.path_id).max().unwrap_or(0) as usize;
+    let mut grouped: Vec<Option<FileInfo>> = (0..=max_path_id).map(|_| None).collect();
+
+    for file in file_list {
+        let idx = file.path_id as usize;
+        if idx >= grouped.len() {
+            grouped.resize(idx + 1, None);
+        }
+        if grouped[idx].is_none() {
+            let mut first = file.clone();
+            first.sub_files = Vec::new();
+            grouped[idx] = Some(first);
+        } else {
+            grouped[idx].as_mut().unwrap().sub_files.push(file.clone());
+        }
+    }
+
+    // Mark entries that actually grouped descendants as archives and set the
+    // stream size (Go's marshalSourceFile sets Archive = len(SubFiles) > 0).
+    let mut result = Vec::with_capacity(grouped.len());
+    for entry in grouped.into_iter().flatten() {
+        if entry.sub_files.is_empty() {
+            result.push(entry);
+            continue;
+        }
+        let mut archive_entry = entry;
+        archive_entry.archive = true;
+        if let Ok(size) = archive_stream_size(&archive_entry.sub_files) {
+            archive_entry.size = size;
+        }
+        result.push(archive_entry);
+    }
+    result
+}
+
+/// Streaming reader over an archive entry: emits each subfile as
+/// `encode_buffer(json(subfile)) + "\n"` followed by the subfile's content.
+///
+/// This is the counterpart of Go's `archiveFileReader`. The reader does not
+/// own a single file; `get_file()` is `None`, so the sender skips the prefix
+/// hash resume exchange for archives (matching Go's `sendFileNameV3`, which
+/// only runs `sendPrefixHash` for non-archive, non-directory files).
+struct ArchiveReader {
+    files: Vec<FileInfo>,
+    idx: usize,
+    src: Option<FileInfo>,
+    file: Option<File>,
+    left: u64,
+    buf: Vec<u8>,
+}
+
+impl ArchiveReader {
+    fn new(files: Vec<FileInfo>) -> Self {
+        Self {
+            files,
+            idx: 0,
+            src: None,
+            file: None,
+            left: 0,
+            buf: Vec::new(),
+        }
+    }
+}
+
+impl Read for ArchiveReader {
+    fn read(&mut self, p: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            if self.src.is_none() {
+                if self.idx >= self.files.len() {
+                    return Ok(0); // EOF
+                }
+                self.src = Some(self.files[self.idx].clone());
+                self.idx += 1;
+
+                // Header line: encode_buffer(json) + '\n'
+                let source = serde_json::to_string(self.src.as_ref().unwrap())
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+                let header = crate::utils::encode_buffer(source.as_bytes())
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+                self.buf.clear();
+                self.buf.extend_from_slice(header.as_bytes());
+                self.buf.push(b'\n');
+
+                if let Some(file) = &self.src {
+                    if file.is_dir {
+                        self.file = None;
+                    } else {
+                        let f = File::open(&file.abs_path).map_err(|e| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::NotFound,
+                                format!("Open [{}] error: {}", file.abs_path, e),
+                            )
+                        })?;
+                        self.file = Some(f);
+                    }
+                    self.left = file.size;
+                }
+            }
+
+            if !self.buf.is_empty() {
+                let n = p.len().min(self.buf.len());
+                p[..n].copy_from_slice(&self.buf[..n]);
+                self.buf.drain(..n);
+                return Ok(n);
+            }
+
+            if let Some(file) = &mut self.file {
+                let m = (p.len() as u64).min(self.left) as usize;
+                if m == 0 {
+                    self.src = None;
+                    self.file = None;
+                    continue;
+                }
+                let n = file.read(&mut p[..m])?;
+                self.left -= n as u64;
+                if self.left == 0 {
+                    self.src = None;
+                    self.file = None;
+                }
+                if n > 0 {
+                    return Ok(n);
+                }
+                continue;
+            }
+
+            self.src = None;
+        }
+    }
+}
+
+/// Total byte size of an archive stream built from `sub_files`.
+fn archive_stream_size(sub_files: &[FileInfo]) -> Result<u64> {
+    let mut size = 0u64;
+    for file in sub_files {
+        let source = serde_json::to_string(file)?;
+        let header = crate::utils::encode_buffer(source.as_bytes())?;
+        size += header.len() as u64 + 1;
+        if !file.is_dir {
+            size += file.size;
+        }
+    }
+    Ok(size)
+}
+
+/// Streaming writer that splits an archive stream back into files.
+///
+/// The archive stream is a sequence of `encode_buffer(json(subfile)) + "\n"`
+/// headers followed by each subfile's content. This writer parses those
+/// headers, creates the destination files/dirs (reusing the archive root's
+/// chosen local name) and writes the content — the counterpart of Go's
+/// `archiveFileWriter`.
+///
+/// It owns everything it needs (config clone, dest path, root local name) so
+/// the session's borrow is not held for the whole transfer; the created paths
+/// are returned on `finish` so the session can record them for stop/delete.
+pub struct ArchiveWriter {
+    dest_path: PathBuf,
+    local_name: String,
+    config: Config,
+    buf: Vec<u8>,
+    file: Option<File>,
+    left: u64,
+    created: Vec<PathBuf>,
+}
+
+impl ArchiveWriter {
+    pub fn new(dest_path: PathBuf, local_name: String, config: Config) -> Self {
+        Self {
+            dest_path,
+            local_name,
+            config,
+            buf: Vec::new(),
+            file: None,
+            left: 0,
+            created: Vec::new(),
+        }
+    }
+
+    /// Consume the writer, returning the list of created paths (for the
+    /// session's stop-and-delete cleanup).
+    pub fn finish(self) -> Vec<PathBuf> {
+        self.created
+    }
+
+    fn apply_perm(path: &Path, perm: Option<u32>) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Some(p) = perm {
+                if let Ok(meta) = fs::metadata(path) {
+                    let mut perms = meta.permissions();
+                    perms.set_mode(p | 0o700);
+                    let _ = fs::set_permissions(path, perms);
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (path, perm);
+        }
+    }
+
+    /// Handle one complete header line: parse the subfile JSON and open the
+    /// destination file (or create the dir).
+    fn handle_header(&mut self, hdr: &[u8]) -> std::io::Result<()> {
+        let json_name = crate::utils::decode_buffer(
+            std::str::from_utf8(hdr)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?,
+        )
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let sub: FileInfo = serde_json::from_slice(&json_name)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+        let file_name = sub.path_name.last().cloned().unwrap_or_default();
+        let full_path = if sub.path_name.len() > 1 {
+            let parent = self
+                .dest_path
+                .join(&self.local_name)
+                .join(sub.path_name[1..sub.path_name.len() - 1].iter().collect::<PathBuf>());
+            fs::create_dir_all(&parent)?;
+            self.created.push(parent.clone());
+            parent.join(&file_name)
+        } else {
+            self.dest_path.join(&self.local_name).join(&file_name)
+        };
+
+        if sub.is_dir {
+            fs::create_dir_all(&full_path)?;
+            self.created.push(full_path.clone());
+            Self::apply_perm(&full_path, sub.perm);
+            self.file = None;
+            self.left = 0;
+            return Ok(());
+        }
+
+        if let Some(parent) = full_path.parent() {
+            if !parent.exists() {
+                fs::create_dir_all(parent)?;
+                self.created.push(parent.to_path_buf());
+            }
+        }
+
+        #[cfg(unix)]
+        let file = {
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut open_opts = fs::OpenOptions::new();
+            open_opts
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(self.config.overwrite);
+            if let Some(p) = sub.perm {
+                open_opts.mode(p | 0o600);
+            }
+            open_opts.open(&full_path)?
+        };
+        #[cfg(not(unix))]
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(self.config.overwrite)
+            .open(&full_path)?;
+
+        self.created.push(full_path.clone());
+        Self::apply_perm(&full_path, sub.perm);
+        self.file = Some(file);
+        self.left = sub.size;
+        Ok(())
+    }
+}
+
+impl Write for ArchiveWriter {
+    fn write(&mut self, p: &[u8]) -> std::io::Result<usize> {
+        // If a file is open and has content left, write into it.
+        if self.left > 0 && self.file.is_some() {
+            let m = (p.len() as u64).min(self.left) as usize;
+            let n = self.file.as_mut().unwrap().write(&p[..m])?;
+            self.left -= n as u64;
+            if self.left == 0 {
+                self.file = None;
+            }
+            return Ok(n);
+        }
+
+        // Accumulate into the header buffer until a newline arrives.
+        if let Some(nl) = p.iter().position(|&b| b == b'\n') {
+            let hdr = &p[..nl];
+            let hdr_owned: Vec<u8>;
+            let hdr: &[u8] = if self.buf.is_empty() {
+                hdr
+            } else {
+                self.buf.extend_from_slice(hdr);
+                hdr_owned = std::mem::take(&mut self.buf);
+                &hdr_owned
+            };
+            self.handle_header(hdr)?;
+            return Ok(nl + 1);
+        }
+
+        self.buf.extend_from_slice(p);
+        Ok(p.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        if let Some(f) = &mut self.file {
+            f.flush()?;
+        }
+        Ok(())
+    }
+}
+
 fn get_new_name(path: &Path, name: &str) -> Result<String> {
     let full_path = path.join(name);
     if !full_path.exists() {
@@ -1912,6 +2363,7 @@ fn check_path_readable(
             size: metadata.len(),
             perm,
             mtime_ns: mtime_nanos(&metadata),
+            sub_files: Vec::new(),
         });
         
         
@@ -1942,6 +2394,7 @@ fn check_path_readable(
         size: 0,
         perm: dir_perm,
         mtime_ns: None,
+        sub_files: Vec::new(),
     });
     
     
@@ -2023,3 +2476,91 @@ mod tests {
         assert!(stop.stopped_flag().load(Ordering::SeqCst));
     }
 }
+
+    /// `archive_source_files` must group same-path_id descendants into one
+    /// entry with `archive=true` and a stream size, and leave single-file or
+    /// overwrite lists unchanged.
+    #[test]
+    fn archive_grouping_groups_same_path_id() {
+        let make = |id: u32, name: &str, is_dir: bool, size: u64| FileInfo {
+            path_id: id,
+            abs_path: format!("/tmp/{name}"),
+            path_name: vec![name.to_string()],
+            is_dir,
+            archive: false,
+            size,
+            perm: None,
+            mtime_ns: None,
+            sub_files: Vec::new(),
+        };
+
+        let list = vec![
+            make(0, "dir", true, 0),
+            make(0, "dir/a.txt", false, 10),
+            make(0, "dir/b.bin", false, 20),
+            make(1, "solo.txt", false, 5),
+        ];
+
+        let grouped = archive_source_files(&list, crate::protocol::PROTOCOL_V4, false);
+        assert_eq!(grouped.len(), 2, "dir + solo");
+        assert!(grouped[0].archive, "dir entry must be an archive");
+        assert_eq!(grouped[0].sub_files.len(), 2);
+        assert!(grouped[0].size > 0, "archive stream size must be set");
+        assert!(!grouped[1].archive, "solo file must not be archived");
+
+        // Overwrite disables grouping.
+        let plain = archive_source_files(&list, crate::protocol::PROTOCOL_V4, true);
+        assert_eq!(plain.len(), 4, "overwrite keeps the flat list");
+        assert!(plain.iter().all(|f| !f.archive));
+
+        // V3 never groups.
+        let v3 = archive_source_files(&list, crate::protocol::PROTOCOL_V3, false);
+        assert_eq!(v3.len(), 4, "V3 keeps the flat list");
+    }
+
+    /// The archive reader/writer must round-trip a directory tree byte-for-byte.
+    #[test]
+    fn archive_reader_writer_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("a.txt"), b"alpha").unwrap();
+        std::fs::write(root.join("sub/b.bin"), vec![0xAB; 4096]).unwrap();
+
+        let mut files = Vec::new();
+        let mut rel = vec!["proj".to_string()];
+        check_path_readable(0, &root, &mut files, &mut rel, &mut std::collections::HashSet::new()).unwrap();
+
+        // Group to one archive entry.
+        let grouped = archive_source_files(&files, crate::protocol::PROTOCOL_V4, false);
+        assert_eq!(grouped.len(), 1);
+        assert!(grouped[0].archive);
+
+        // Read the archive stream into a buffer.
+        let mut reader = ArchiveReader::new(grouped[0].sub_files.clone());
+        let mut stream = Vec::new();
+        reader.read_to_end(&mut stream).unwrap();
+        assert_eq!(stream.len() as u64, grouped[0].size, "stream size must match");
+
+        // Replay it through the ArchiveWriter into a fresh dest tree.
+        let dest = tempfile::tempdir().unwrap();
+        let mut writer = ArchiveWriter::new(
+            dest.path().to_path_buf(),
+            "proj".to_string(),
+            crate::protocol::Config::default(),
+        );
+        writer.write_all(&stream).unwrap();
+        let created = writer.finish();
+        assert!(!created.is_empty(), "archive writer must create files");
+
+        assert_eq!(
+            std::fs::read(dest.path().join("proj/a.txt")).unwrap(),
+            b"alpha",
+            "a.txt must round-trip"
+        );
+        assert_eq!(
+            std::fs::read(dest.path().join("proj/sub/b.bin")).unwrap(),
+            vec![0xAB; 4096],
+            "b.bin must round-trip"
+        );
+    }

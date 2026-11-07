@@ -883,6 +883,8 @@ fn run_sender(state: &Arc<ZmodemState>, files: Vec<String>) -> Result<()> {
     // Finish session.
     state.write_server(&encode_hex_header(ZFIN, &[0, 0, 0, 0]))?;
     let _ = wait_for_fin(&feed, &mut decoder, state);
+    // Emit "OO\b\b" to confirm clean end (matching Go's zmodemOverAndOut and lrzsz saybibi/ackbibi).
+    let _ = state.write_server(b"OO\x08\x08");
     Ok(())
 }
 
@@ -1182,7 +1184,7 @@ fn recv_file_data(
                 ParseResult::Data(payload, frameend) => {
                     f.write_all(&payload)?;
                     state.update_progress(payload.len() as i64);
-                    if frameend == ZCRCW {
+                    if frameend == ZCRCW || frameend == ZCRCQ {
                         let cur = std::fs::metadata(path)?.len() as u32;
                         state.write_server(&encode_hex_header(ZACK, &hdr_pos(cur)))?;
                     }

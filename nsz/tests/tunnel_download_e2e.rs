@@ -242,3 +242,55 @@ fn check_paths_readable_matches_saved_names() {
     assert!(!info.is_dir);
     assert_eq!(info.size, f.metadata().unwrap().len());
 }
+
+/// V4 directory archive: with `overwrite` off, a directory transfer is grouped
+/// into one streamed archive entry (Go's `archiveSourceFiles` / `SubFiles`).
+/// The bytes must be identical to a non-archive transfer, and the saved-name
+/// list must still be just the directory root.
+#[test]
+fn tunnel_download_directory_archive_v4() {
+    let src_dir = tempfile::tempdir().unwrap();
+    let dest_dir = tempfile::tempdir().unwrap();
+
+    let root = src_dir.path().join("proj");
+    std::fs::create_dir_all(root.join("sub/deep")).unwrap();
+
+    let f1p = root.join("a.txt");
+    std::fs::write(&f1p, "hello archive ".repeat(2000)).unwrap();
+    let f1 = f1p;
+    let f2 = write_test_file(&root.join("sub"), "b.bin", 300_000, 0xcafe_0003);
+    let f3p = root.join("sub/deep/c.dat");
+    std::fs::write(&f3p, "tail").unwrap();
+    let f3 = f3p;
+
+    // No -o: archive grouping is active (V4).
+    let mut server = Spawn::nsz(&["-b", "-d", root.to_str().unwrap()]);
+    let trigger = wait_for_trigger(&mut server);
+    assert_eq!(trigger.mode, 'S');
+
+    let dest = dest_dir.path();
+    let saved = download_from(&trigger, dest);
+
+    for (rel, src_path) in [
+        ("proj/a.txt", &f1),
+        ("proj/sub/b.bin", &f2),
+        ("proj/sub/deep/c.dat", &f3),
+    ] {
+        let got = dest.join(rel);
+        assert!(got.exists(), "missing {rel}");
+        assert_eq!(
+            std::fs::read(src_path).unwrap(),
+            std::fs::read(&got).unwrap(),
+            "content mismatch for {rel}"
+        );
+    }
+
+    assert_eq!(
+        saved.len(),
+        1,
+        "archive should still save one top-level name, got {saved:?}"
+    );
+    assert_eq!(saved[0], "proj", "saved name mismatch, got {saved:?}");
+
+    finish_server(&mut server.child);
+}

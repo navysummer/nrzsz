@@ -150,7 +150,7 @@ pub struct ProtocolFeatures {
 }
 
 pub fn is_windows_unique_id(id: &str) -> bool {
-    id.ends_with("10")
+    id == "1" || id.ends_with("10")
 }
 
 pub fn is_tmux_normal_mode_id(id: &str) -> bool {
@@ -462,6 +462,11 @@ pub struct FileInfo {
     /// Modification time in nanoseconds since epoch (for `-Y` newer-check).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mtime_ns: Option<i64>,
+    /// V4 archive: descendants of a directory grouped into one streamed entry
+    /// (Go's `sourceFile.SubFiles`). Never serialized — the archive is sent as
+    /// a separate header-per-subfile stream, so the wire JSON stays flat.
+    #[serde(skip)]
+    pub sub_files: Vec<FileInfo>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

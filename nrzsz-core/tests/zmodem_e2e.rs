@@ -191,3 +191,83 @@ fn zmodem_download_smoke() {
 
     let _ = server.child.wait();
 }
+
+/// Auto-rename (`-E`): when the destination already exists and auto_rename is
+/// on, the incoming file must land at `<name>.1` and the original must be
+/// left untouched.
+#[test]
+#[ignore = "requires lrzsz on PATH"]
+fn zmodem_download_auto_rename() {
+    if !rz_sz_available() {
+        eprintln!("skipping: sz not found");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let src_dir = tmp.path().join("src");
+    let dst_dir = tmp.path().join("dst");
+    std::fs::create_dir_all(&src_dir).unwrap();
+    std::fs::create_dir_all(&dst_dir).unwrap();
+    let payload = vec![0x77; 128 * 1024];
+    std::fs::write(src_dir.join("data.bin"), &payload).unwrap();
+    // Destination already has data.bin with different content.
+    std::fs::write(dst_dir.join("data.bin"), b"ORIGINAL").unwrap();
+
+    // Server side: `sz` sends from src_dir.
+    let mut server = spawn_server("sz", &src_dir, &["data.bin"]);
+    // Client side: download state with auto_rename=true.
+    let state = Arc::new(ZmodemState::new(
+        false,
+        true, // auto_rename
+        Arc::new(Mutex::new(Box::new(server.stdin))),
+        Arc::new(Mutex::new(Box::new(std::io::sink()))),
+    ));
+
+    let state_pump = state.clone();
+    let mut server_stdout = server.stdout;
+    let pump = std::thread::spawn(move || {
+        let mut buf = [0u8; 8192];
+        loop {
+            match server_stdout.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if !state_pump.handle_server_output(&buf[..n]) {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let st = state.clone();
+    let dst_dir_clone = dst_dir.clone();
+    std::thread::spawn(move || {
+        nrzsz_core::zmodem::handle_zmodem_event(
+            st,
+            move || Ok(vec![]),
+            move || Ok(dst_dir_clone.to_string_lossy().to_string()),
+        );
+    });
+
+    std::thread::sleep(Duration::from_secs(3));
+    let _ = server.child.kill();
+    let _ = pump.join();
+
+    // The original must be untouched.
+    assert_eq!(
+        std::fs::read(dst_dir.join("data.bin")).unwrap(),
+        b"ORIGINAL",
+        "original file must be untouched by auto-rename"
+    );
+    // The incoming file must land at data.bin.1 (or a later suffix).
+    let renamed = dst_dir.join("data.bin.1");
+    assert!(
+        renamed.exists(),
+        "expected renamed file at {:?}",
+        renamed
+    );
+    let got = std::fs::read(&renamed).unwrap();
+    assert_eq!(got, payload, "renamed payload mismatch");
+
+    let _ = server.child.wait();
+}

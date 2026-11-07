@@ -48,12 +48,12 @@ sections below, this table only states the status and where to read more.
 | Windows build fix | ✅ (compile) | `windows-sys` symbols | §1.4, §4.3 |
 | Relay + tunnel hello desync fix | ✅ | filter+relay e2e harness | §4.8 |
 | Download-direction e2e harness | ✅ | `nsz/tests/tunnel_download_e2e.rs` | §4.7 |
+| V4 directory archive (Go groups a dir's files into one streamed `SubFiles` entry) | ✅ implemented | byte-identical e2e + unit round-trip | §4.10 |
 
 ### 0.2 Pending / not yet implemented
 
 | Area | Status | Reason / where it will land | Details |
 |---|---|---|---|
-| V4 directory archive (Go groups a dir's files into one streamed `SubFiles` entry) | ⏳ not implemented | nrzsz sends each file individually (correct, only a wire-size optimization) | §3 |
 | Non-tunnel fallback (Go can fall back to raw terminal streams when no connector is set) | ⏳ design choice | nrzsz always transfers over the TCP tunnel | §3 |
 | Relay + `-o`/`-u`/`-D` | ⏳ not supported | relay only bridges (matches Go — relay does tracelog only) | §3 |
 | Windows runtime (ConPTY, `binary=false`, newline `!\n`) | ⏳ untested | no Windows host available; build compiles | §3 |
@@ -63,7 +63,7 @@ sections below, this table only states the status and where to read more.
 | Area | Status | Note | Details |
 |---|---|---|---|
 | `-Y` semantics vs lrzsz | ⚠️ deliberate divergence | nrzsz `-Y` = overwrite-if-newer; lrzsz `-Y` = clobber + skip-if-not-found (`ZF1_ZMSKNOLOC`) | §3 |
-| zmodem auto-rename (`-E`) | ⚠️ partial | `ZmodemProxy` stubs retained; auto-rename via `resolve_dest` exists | §5 |
+| zmodem auto-rename (`-E`) | ✅ implemented & verified | `-E` → `set_zmodem_auto_rename`; `resolve_dest` picks `name.N` when the dest exists; e2e test passes against real `rz`/`sz` (§4.11) |
 
 ### 0.4 To fix / watch
 
@@ -220,7 +220,7 @@ session (§4.6).
 | **Relay + `-o`/`-u`/`-D`** | Not supported | Relay only bridges; these flags are filter-mode-only (matches Go — relay only does tracelog) |
 | **`api.rs` surface** | ✅ done (§4.9) | rebuilt as a real embedding surface: `NrzszOptions::build_filter` (→ Config + setters), `TransferStateHandler` (bool start/stop callback) → `apply_to(filter)`; Go's `TransferState` enum removed |
 | **`-Y` vs lrzsz semantics** | Divergence | nrzsz `-Y` = "overwrite if source newer"; lrzsz `-Y` = "clobber + skip-if-not-found" (`ZF1_ZMSKNOLOC`). Deliberate; nrzsz targets Go, which has no `-Y`. |
-| **V4 directory archive** | Not implemented | Go groups a directory's files into one streamed `SubFiles` archive entry; nrzsz sends each file individually (correct, only a wire-size optimization) |
+| **V4 directory archive** | ✅ implemented (§4.10) | Go groups a directory's files into one streamed `SubFiles` archive entry; nrzsz now does the same (byte-identical, e2e + unit verified) |
 | **Non-tunnel fallback** | Design choice | nrzsz always transfers over the TCP tunnel; Go can fall back to raw terminal streams when no connector is set |
 
 ---
@@ -484,6 +484,83 @@ as designed; the harness exercises the rewritten-port TCP-bridge path, which
 is what a rewritten trigger actually drives — the raw path remains available
 for previous-hop filters that run transfer over raw streams).
 
+### 4.10 V4 directory archive (this session)
+
+Closed the last functional gap vs trzsz-go: a directory transfer now groups
+each top-level source path's descendants into **one streamed archive entry**
+(Go's `archiveSourceFiles` / `sourceFile.SubFiles`) instead of sending each
+file individually. The bytes are identical; the change is a wire-size
+optimization (one `NAME`/`SIZE`/`MD5` per top-level path instead of per file)
+and matches Go's V4 behavior exactly.
+
+Implementation (all in `nrzsz-core/src/transfer.rs`):
+
+1. **`FileInfo.sub_files`** (`protocol.rs`) — `#[serde(skip)]` so the wire
+   JSON stays flat; the archive stream carries per-subfile headers instead.
+2. **`archive_source_files`** — groups by `path_id`, sets `archive=true` and
+   the stream size on entries that actually gathered descendants. Gated on
+   `protocol >= V4 && !overwrite` (Go's `archiveSourceFiles` bails on
+   `Overwrite`, so `-o`/`-y` keeps the flat path).
+3. **`ArchiveReader`** (`Read`) — emits `encode_buffer(json(subfile)) + "\n"`
+   then each subfile's content, exactly like Go's `archiveFileReader`.
+4. **`ArchiveWriter`** (`Write`) — the receive-side parser: splits the stream
+   back into files, creating directories on the fly and reusing the archive
+   root's chosen local name.
+5. **`send_data_with_compress` / `recv_data_with_compress`** — the previous
+   file-only send/recv loops were refactored into generic `&mut dyn Read` /
+   `&mut dyn Write` versions; `send_file_data_with_compress` /
+   `recv_file_data_with_compress` now delegate. The archive path reuses them
+   with the archive reader/writer.
+6. **`send_file_name_v3` / `recv_file_name_v3`** — skip the prefix-hash resume
+   exchange for archives (Go only runs `sendPrefixHash` for non-archive files,
+   since an archive has no single backing file).
+7. **`send_files` / `recv_files`** — group via `archive_source_files`, send
+   the archive as one `SIZE` + `COMP` + `DATA` + `MD5`, and on receive feed the
+   stream to an `ArchiveWriter`.
+
+Verification:
+- New unit tests: `archive_grouping_groups_same_path_id` (grouping, overwrite /
+  V3 gating) and `archive_reader_writer_round_trip` (byte-for-byte directory
+  round-trip through reader + writer).
+- New e2e: `tunnel_download_directory_archive_v4` (`nsz/tests/
+  tunnel_download_e2e.rs`) — real `nsz` server, no `-o` (so archiving is
+  active), 3 files in a nested tree, byte-identical, saved-name list is just
+  the dir root (Go parity).
+- `cargo test --workspace` = **72 lib + 13 protocol + 4 tunnel e2e + 1 relay
+  download + 1 relay upload, 0 failed**; `cargo build --release --workspace`
+  clean (0 warnings).
+
+### 4.11 ZMODEM auto-rename `-E` — verified this session
+
+The `-E`/`--rename` flag (zmodem: rename if the target file exists) was listed
+as "partial" because the legacy `ZmodemProxy` API shims are no-op stubs. The
+active engine never used them: `detect_zmodem`/`ZmodemState` are the real
+path, and `resolve_dest` (zmodem.rs) already implemented the rename behavior.
+What was missing was **end-to-end verification** of the `-E` flow.
+
+Wiring confirmed by source inspection:
+- `nrzsz/src/main.rs` — `-E` → `filter.set_zmodem_auto_rename(args.rename)`.
+- `filter.rs` — `set_zmodem_auto_rename` stores the flag; `detect_zmodem` is
+  called with it and threads it into `ZmodemState::new(upload, auto_rename,
+  ...)`.
+- `zmodem.rs` — the download receiver calls
+  `resolve_dest(dir, &name, state.auto_rename)` before opening the file; when
+  the destination exists and auto_rename is on, it picks `name.1`, `name.2`,
+  ... and leaves the original untouched.
+- `config.rs` / `filter.rs` — `~/.trzsz.conf` `zmodemautorename` also drives
+  the same flag.
+
+Verification:
+- New e2e: `zmodem_download_auto_rename` (`nrzsz-core/tests/zmodem_e2e.rs`) —
+  real `sz` sends `data.bin` into a dir that already has `data.bin` with
+  different content, `auto_rename=true`; asserts the original is untouched and
+  the incoming file lands at `data.bin.1` byte-identical.
+- `cargo test -p nrzsz-core --test zmodem_e2e -- --ignored` = 3 passed
+  (upload smoke, download smoke, auto-rename).
+
+The `ZmodemProxy` stubs remain as documented API-compat shims only; they are
+not on any active path.
+
 
 ---
 
@@ -499,13 +576,14 @@ Remaining differences vs trzsz-go:
 | `~/.trzsz.conf` (Go keys) | ✅ now read | `config.rs::load_trzsz_conf` + `filter.rs::read_config` |
 | `ProgressColorPair` gradient | ✅ now reaches progress bar | `BlendLuv` matches go-colorful byte-for-byte; `set_progress_color_pair` now populates the transfer `Config` (§4.5) |
 | Go embedding setters | ✅ done (§4.9) | `api.rs` is now a real embedding surface: `NrzszOptions::build_filter` builds a filter wired via the `dragfile`/`zmodem`/`osc52` setters; `TransferStateHandler` hands a `bool` callback (Go's `SetTransferStateCallback(start/stop)`) into the filter via `apply_to`; `NrzszOptions` docs what remains caller-side (connector/paths) |
-| zmodem auto-rename `-E` | ⚠️ partial | `ZmodemProxy` stubs retained; auto-rename via `resolve_dest` exists |
+| zmodem auto-rename `-E` | ✅ implemented & verified (§4.11) | `-E` → `set_zmodem_auto_rename`; `resolve_dest` picks `name.N`; e2e `zmodem_download_auto_rename` passes against real `rz`/`sz` |
 | Windows ConPTY | ⚠️ build fixed, runtime untested | `windows_flush` migrated; no Windows host to execute |
 | Warp terminal drag prefixes | ✅ handled | `detect_drag_files` handles old/new warp prefixes + bracketed paste |
 | `StopTransferringFiles(stopAndDelete)` reaches live session | ✅ now wired | shared `TransferStop` handle; wrapper/SIGINT/tmux-CC stop the running transfer in place (§4.6) |
 | Wrapper SIGINT vs SIGTERM split | ✅ now split | SIGINT keeps the child + stops the transfer; SIGTERM terminates (§4.6) |
 | `OneTimeUpload` result + 10s watchdog | ✅ now resolved | `run_transfer` resolves the channel; 10s timer reports "did not start" (§4.6) |
 | Ctrl+C during transfer stops locally | ✅ now handled | `process_input` stops the active session instead of forwarding `0x03` to the remote (§4.6) |
+| V4 directory archive (`SubFiles`) | ✅ now implemented (§4.10) | `archive_source_files` groups a dir's files into one streamed entry; `ArchiveReader`/`ArchiveWriter` round-trip byte-identical |
 
 **What nrzsz has that trzsz-go also has (matched):** V1–V4 negotiation,
 zstd+zlib compression, V3 prefix-hash resume, directory transfer, fork,
@@ -553,14 +631,13 @@ nrzsz's directory support is a *superset* of lrzsz.
 
 ---
 
-## 7. Recommended next steps (highest value first)
-
 1. **Windows runtime test** — run `pty/windows.rs` (ConPTY) and `binary=false`
    on a real Windows host.
 2. ~~**Wire `api.rs` free functions to `NrzszFilter` setters**~~ ✅ done (§4.9).
 3. ~~**Add an integration-test harness** for filter+relay~~ ✅ done (§4.8).
 4. ~~Fork-with-tunnel gating~~ ✅ done (§4.5 item 1).
 5. ~~Download-direction end-to-end harness~~ ✅ done (§4.7).
+6. ~~**V4 directory archive (`SubFiles`)**~~ ✅ done (§4.10).
 
 ---
 
@@ -586,14 +663,18 @@ nrzsz's directory support is a *superset* of lrzsz.
 
 ## 9. Test / verification status
 
-- `cargo test --workspace`: **70 lib + 13 protocol + 3 tunnel e2e + 1 relay
-  download + 1 relay upload, 0 failed** (plus 2 zmodem smoke `--ignored`).
+- `cargo test --workspace`: **72 lib + 13 protocol + 4 tunnel e2e + 1 relay
+  download + 1 relay upload, 0 failed** (plus 3 zmodem e2e `--ignored`:
+  upload smoke, download smoke, auto-rename — §4.11).
   New: `nsz/tests/tunnel_download_e2e.rs` — download direction over a real
   `nsz` server + TCP tunnel (file + directory, byte-identical), and the
   compress-contract regression it caught (§4.7); `nsz/tests/
   filter_relay_download_e2e.rs` and `nrz/tests/filter_relay_upload_e2e.rs` —
   filter+relay full stack over a real server behind `NrzszRelay`
   (§4.8, plus the relay hello-desync fix).
+  V4 archive this session: `archive_grouping_groups_same_path_id` +
+  `archive_reader_writer_round_trip` (unit) and
+  `tunnel_download_directory_archive_v4` (e2e, §4.10).
   Prior regression tests: `shared_stop_handle_stops_session`,
   `shared_stop_handle_delete_flag`, `test_one_time_upload_slot_plumbing`,
   `test_process_input_ctrl_c_during_transfer_stops` (this session, §4.6);
